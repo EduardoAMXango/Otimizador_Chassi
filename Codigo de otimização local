@@ -1,371 +1,159 @@
 import numpy as np
-from typing import Callable, Tuple, Dict, List, Union
-from numba import njit
-from scipy.spatial import distance_matrix
-from mpl_toolkits.mplot3d.art3d import Line3DCollection
 import matplotlib.pyplot as plt
 from estrutura_main import Estrutura
+import random
 
-class Estrutura3DEvolutiva:
-    def __init__(self,
-                 avaliador: Callable[[np.ndarray, list], Tuple[float, float, float, float]],
-                 pop_size: int = 30,
-                 F: float = 0.8,
-                 CR: float = 0.9,
-                 geracoes: int = 100,
-                 limites_dim: Dict[str, Tuple[float, float]] = None,
-                 dist_minima: float = 0.15,
-                 dist_maxima_conexao: float = 0.5):
-        
-        self.avaliador = avaliador
-        self.pop_size = pop_size
+class ChassiDE:
+    def __init__(self, n_nodes=50, pop_size=100, ngen=100, F=0.8, CR=0.7, min_dist=0.15,max_dist=0.7):
+        self.N_NODES = n_nodes
+        self.POP_SIZE = pop_size
+        self.NGEN = ngen
         self.F = F
         self.CR = CR
-        self.geracoes = geracoes
-        self.dist_minima = dist_minima
-        self.dist_max_conexao = dist_maxima_conexao
-        self.limites_dim = limites_dim or {
-            'x': (-0.3, 0.3),
-            'y': (-1.0, 1.0),
-            'z': (0.0, 1.0)
-        }
+        self.MIN_DIST = min_dist
+        self.MAX_DIST = max_dist
+        self.MAX_X, self.MAX_Y, self.MAX_Z = 0.6, 2.0, 1.0
+        self.population = [self.criar_individuo_simetrico() for _ in range(pop_size)]
 
-        # Componentes estruturais obrigatórios (FSAE Rules)
-        self.componentes_obrigatorios = {
-            'main_roll_hoop': [
-                (-0.1, -0.3, 0.8), (0.1, -0.3, 0.8),
-                (-0.1, -0.4, 0.3), (0.1, -0.4, 0.3)
-            ],
-            'front_roll_hoop': [
-                (-0.1, -1.0, 0.6), (0.1, -1.0, 0.6),
-                (-0.1, -1.0, 0.3), (0.1, -1.0, 0.3)
-            ],
-            'side_impact': [
-                (-0.3, -0.7, 0.3), (0.3, -0.7, 0.3),
-                (-0.3, 0.7, 0.3), (0.3, 0.7, 0.3)
-            ]
-        }
-
-        self.lower_bounds = np.array([self.limites_dim['x'][0], 0.0, self.limites_dim['z'][0]])
-        self.upper_bounds = np.array([self.limites_dim['x'][1], self.limites_dim['y'][1], self.limites_dim['z'][1]])
-
-    def segmentos_se_cruzam(self, a: np.ndarray, b: np.ndarray, c: np.ndarray, d: np.ndarray) -> bool:
-        """Verifica se os segmentos AB e CD se intersectam em 3D."""
-        v1 = b - a
-        v2 = d - c
-        v3 = c - a
+    def criar_individuo_simetrico(self):
+        nodes = []
+        half = self.N_NODES // 2
+        for _ in range(half):
+            zona = random.choices(["dianteira", "cockpit", "traseira"], weights=[1, 2, 1])[0]
+            y = random.uniform(*{"dianteira": (0.0, 0.5), "cockpit": (0.5, 1.5), "traseira": (1.5, 2.0)}[zona])
+            x = random.uniform(0.1, self.MAX_X)
+            z = random.uniform(-0.1, self.MAX_Z)
+            nodes.append([x, y, z])
+            nodes.append([-x, y, z])
         
-        cross_v1v2 = np.cross(v1, v2)
-        denom = np.dot(cross_v1v2, cross_v1v2)
+        elements = []
+        for i in range(0, len(nodes), 2):
+            elements.append((i+1, i+2))
+            if i+4 < len(nodes):
+                elements.append((i+1, i+5))
+                elements.append((i+2, i+6))
         
-        if np.isclose(denom, 0):
-            return False
+        return [nodes, elements]
+
+    def mutacao(self, base, a, b, c):
+        base_nodes = np.array(base[0])
+        a_nodes = np.array(a[0])
+        b_nodes = np.array(b[0])
+        c_nodes = np.array(c[0])
+        mutant_nodes = base_nodes + self.F * (a_nodes - b_nodes + c_nodes - base_nodes)
         
-        t = np.dot(np.cross(v3, v1), cross_v1v2) / denom
-        s = np.dot(np.cross(v3, v2), cross_v1v2) / denom
-        
-        return 0 <= s <= 1 and 0 <= t <= 1
+        # Clipping e simetria
+        new_nodes = []
+        for i in range(0, len(mutant_nodes), 2):
+            x, y, z = mutant_nodes[i]
+            x = np.clip(x, 0.1, self.MAX_X)
+            y = np.clip(y, 0.0, self.MAX_Y)
+            z = np.clip(z, -0.3, self.MAX_Z)
+            new_nodes.append([x, y, z])
+            new_nodes.append([-x, y, z])
+        return [new_nodes, base[1]]
 
-    def bbox_distancia(self, box1: Tuple[np.ndarray, np.ndarray], box2: Tuple[np.ndarray, np.ndarray]) -> float:
-        """Calcula distância mínima entre bounding boxes."""
-        return np.max(np.abs(box1[0] - box2[1]))
+    def recombinacao(self, target, mutant):
+        trial_nodes = []
+        for (t, m) in zip(target[0], mutant[0]):
+            if random.random() < self.CR:
+                trial_nodes.append(m)
+            else:
+                trial_nodes.append(t)
+        return [trial_nodes, target[1]]
 
-    def gerar_populacao_inicial(self, max_nos: int = 100) -> List[np.ndarray]:
-        pop = []
-        componentes = np.array([p for pts in self.componentes_obrigatorios.values() for p in pts])
-        
-        for _ in range(self.pop_size):
-            nos_fixos = componentes.copy()
-            
-            zonas = {
-                'front_bulkhead': (-0.2, 0.2, -1.0, -0.8, 0.2, 0.6),
-                'rear_bulkhead': (-0.2, 0.2, 0.5, 0.7, 0.2, 0.6),
-                'floor': (-0.3, 0.3, -1.0, 1.0, 0.05, 0.2)
-            }
-            
-            novos_nos = []
-            for zone in zonas.values():
-                n_points = max(5, (max_nos - len(componentes)) // len(zonas))
-                x = np.random.uniform(zone[0], zone[1], n_points)
-                y = np.random.uniform(zone[2], zone[3], n_points)
-                z = np.random.uniform(zone[4], zone[5], n_points)
-                novos_nos.extend(np.column_stack((x, y, z)))
-            
-            populacao = np.vstack([nos_fixos, novos_nos])
-            populacao = self.aplicar_simetria(populacao)
-            pop.append(populacao)
-        return pop
+    def avaliar(self, individuo):
+        try:
+            nodes, elements = individuo
+            estrutura = Estrutura(elements, nodes)
+            estrutura.matrizes_global()
+            _, _, freq = estrutura.modal_analysis()
 
-    def aplicar_simetria(self, nos: np.ndarray) -> np.ndarray:
-        metade = nos[~np.isclose(nos[:,1], 0)]
-        espelho = metade.copy()
-        espelho[:, 1] *= -1
-        return np.unique(np.vstack([nos, espelho]), axis=0)
+            F_global = np.zeros(estrutura.num_dofs)
+            F_global[6*4 + 1] = 3000
+            F_global[6*5 + 1] = 3000
+            deslocamentos = estrutura.static_analysis(F_global)
+            stresses = estrutura.compute_stress(estrutura.compute_strain2(deslocamentos), 210e9, 0.27)
+            von_mises = estrutura.compute_von_mises(stresses)
 
-    def gerar_conexoes(self, nos: np.ndarray) -> List[Tuple[int, int]]:
-        conexoes = []
-        
-        # Mapear nós dos componentes obrigatórios
-        componentes = {
-            name: [self.find_closest_node(nos, pt) for pt in points]
-            for name, points in self.componentes_obrigatorios.items()
-        }
+            massa = sum(estrutura.calcular_comprimento(e) * 7850 * 0.0125 for e in elements)
+            tensao_max = np.max(von_mises)
 
-        # Conexões Main Roll Hoop
-        mrhi = componentes['main_roll_hoop']
-        conexoes += [
-            (mrhi[0], mrhi[1]),
-            (mrhi[0], mrhi[2]),
-            (mrhi[1], mrhi[3]),
-            (mrhi[2], mrhi[3])
-        ]
+            penalidade = 0
+            for i in range(0, len(nodes), 2):
+                n1, n2 = nodes[i], nodes[i+1]
+                if not (np.isclose(n1[0], -n2[0], atol=0.05) and np.isclose(n1[1:], n2[1:], atol=0.05).all()):
+                    penalidade += 1e4
 
-        # Conexões Front Roll Hoop
-        frhi = componentes['front_roll_hoop']
-        conexoes += [
-            (frhi[0], frhi[1]),
-            (frhi[0], frhi[2]),
-            (frhi[1], frhi[3]),
-            (frhi[2], frhi[3])
-        ]
+            y_coords = [n[1] for n in nodes]
+            if max(y_coords) - min(y_coords) < 2.0:
+                penalidade += 1e5
 
-        # Conexão entre roll hoops
-        conexoes += [
-            (mrhi[0], frhi[0]),
-            (mrhi[1], frhi[1]),
-            (mrhi[2], frhi[2]),
-            (mrhi[3], frhi[3])
-        ]
+            conexoes_por_no = [0] * len(nodes)
+            for i, j in elements:
+                if i-1 < len(nodes) and j-1 < len(nodes):
+                    conexoes_por_no[i-1] += 1
+                    conexoes_por_no[j-1] += 1
+                    dist = np.linalg.norm(np.array(nodes[i-1]) - np.array(nodes[j-1]))
+                    if dist < self.MIN_DIST:
+                        penalidade += 1e4
+                    if dist > self.MAX_DIST:  # penalidade para comprimento excessivo
+                        penalidade += 1e4
 
-        # Conexões Side Impact
-        si = componentes['side_impact']
-        conexoes += [
-            (si[0], si[1]),
-            (si[2], si[3]),
-            (si[0], si[2]),
-            (si[1], si[3])
-        ]
+            for count in conexoes_por_no:
+                if count < 2:
+                    penalidade += 5e5
 
-        # Conexões por distância com restrições
-        dist_matrix = distance_matrix(nos, nos)
-        mask = (dist_matrix > self.dist_minima) & (dist_matrix < self.dist_max_conexao)
-        np.fill_diagonal(mask, False)
+            return massa + penalidade, freq[0], tensao_max
 
-        # Priorizar conexões longitudinais e transversais
-        for i in range(len(nos)):
-            # Conexões longitudinais (eixo Y)
-            y_prox = np.argsort(np.abs(nos[:,1] - nos[i,1]))[1:4]
-            for j in y_prox:
-                if mask[i,j]:
-                    conexoes.append((i,j))
+        except:
+            return 1e9, 0, 1e9
 
-            # Conexões transversais (eixo X)
-            x_prox = np.where(np.isclose(nos[:,1], nos[i,1]))[0]
-            x_prox = x_prox[np.argsort(np.abs(nos[x_prox,0] - nos[i,0]))[1:2]]
-            for j in x_prox:
-                if mask[i,j]:
-                    conexoes.append((i,j))
-
-        # Remover duplicatas e retornar
-        return list(set(conexoes))
-
-    def find_closest_node(self, nos: np.ndarray, target: Tuple[float, float, float]) -> int:
-        return np.argmin(np.linalg.norm(nos - target, axis=1))
-
-    def avaliar(self, individuo: np.ndarray) -> Tuple[float, float, float, float, List[Tuple[int, int]], np.ndarray]:
-        conexoes = self.gerar_conexoes(individuo)
-        penalidade = self.restricoes_geometricas_fsae(individuo, self.componentes_obrigatorios)
-        intersecoes = 0
-        
-        conexoes_array = np.array([[individuo[i], individuo[j]] for i, j in conexoes])
-        n_conexoes = len(conexoes_array)
-        
-        for i in range(n_conexoes):
-            a1, b1 = conexoes_array[i]
-            box_i = (np.min([a1, b1], axis=0), np.max([a1, b1], axis=0))
-            
-            for j in range(i+1, n_conexoes):
-                a2, b2 = conexoes_array[j]
-                box_j = (np.min([a2, b2], axis=0), np.max([a2, b2], axis=0))
-                
-                if self.bbox_distancia(box_i, box_j) > 0.5:
-                    continue
-                
-                if self.segmentos_se_cruzam(a1, b1, a2, b2):
-                    intersecoes += 1
-        
-        graus = np.zeros(len(individuo), dtype=int)
-        for a, b in conexoes:
-            graus[a] += 1
-            graus[b] += 1
-        
-        penalidade += (
-            intersecoes * 5000 +
-            max(0, len(conexoes) - 150) * 2000 +
-            max(0, len(individuo) - 100) * 5000 +
-            np.sum(np.maximum(graus - 6, 0)**3) * 1e6 +
-            np.sum(graus < 2) * 10000 +
-            (contar_componentes(len(individuo), conexoes) - 1) * 1e8
-        )
-
-        
-        fitness, KT, KF, pen_regras = self.avaliador(individuo, conexoes)
-        total_fitness = fitness + penalidade + pen_regras
-        
-        return total_fitness, KT, KF, penalidade, conexoes, graus
-
-    def mutar(self, pop: List[np.ndarray], i: int) -> np.ndarray:
-        indices = [j for j in range(self.pop_size) if j != i]
-        a, b, c = np.random.choice(indices, 3, replace=False)
-        
-        mutant = pop[a] + self.F * (pop[b] - pop[c])
-        
-        for pt in self.componentes_obrigatorios.values():
-            for p in pt:
-                idx = self.find_closest_node(mutant, p)
-                mutant[idx] = p
-                
-        return mutant
-
-    def crossover(self, target: np.ndarray, mutant: np.ndarray) -> np.ndarray:
-        trial = np.copy(target)
-        n = len(target)
-        
-        corte = int(n * 0.3)
-        trial[:corte] = mutant[:corte]
-        
-        mask = np.random.rand(n - corte, 3) < self.CR
-        trial[corte:][mask] = mutant[corte:][mask]
-        
-        return trial
-
-    def evoluir(self) -> Tuple[np.ndarray, List[Tuple[int, int]], List[float]]:
-        pop = self.gerar_populacao_inicial()
-        resultados = [self.avaliar(ind) for ind in pop]
-        fitness = np.array([r[0] for r in resultados])
-        historico = []
-
-        for g in range(self.geracoes):
-            print(f"Geração {g+1}/{self.geracoes}", end="\r")
+    def evoluir(self):
+        for gen in range(self.NGEN):
             nova_pop = []
-            nova_fitness = []
-            
-            for i in range(self.pop_size):
-                trial = self.crossover(pop[i], self.mutar(pop, i))
-                trial_fitness, *_ = self.avaliar(trial)
-                
-                if trial_fitness < fitness[i]:
+            for i, target in enumerate(self.population):
+                indices = list(range(self.POP_SIZE))
+                indices.remove(i)
+                a, b, c = random.sample([self.population[j] for j in indices], 3)
+
+                mutant = self.mutacao(target, a, b, c)
+                trial = self.recombinacao(target, mutant)
+
+                f_target = self.avaliar(target)
+                f_trial = self.avaliar(trial)
+
+                if f_trial[0] < f_target[0]:
                     nova_pop.append(trial)
-                    nova_fitness.append(trial_fitness)
                 else:
-                    nova_pop.append(pop[i])
-                    nova_fitness.append(fitness[i])
-            
-            melhor_idx = np.argmin(nova_fitness)
-            historico.append(nova_fitness[melhor_idx])
-            
-            pop = nova_pop
-            fitness = np.array(nova_fitness)
+                    nova_pop.append(target)
 
-        melhor_idx = np.argmin(fitness)
-        melhor = pop[melhor_idx]
-        fit, KT, KF, penalidade, conexoes, graus = self.avaliar(melhor)
+            self.population = nova_pop
+            melhor = min(self.population, key=lambda ind: self.avaliar(ind)[0])
+            print(f"Geração {gen+1}: melhor massa = {self.avaliar(melhor)[0]:.1f}", end="\r")
 
-        print("\n" + "="*50)
-        print(f"Melhor solução encontrada | Fitness: {fit:.2f}")
-        print("="*50)
-        print(f"- KT: {KT:.2f} Nm/rad | KF: {KF:.2f} N/m")
-        print(f"- Nós: {len(melhor)}/100 | Conexões: {len(conexoes)}/150")
-        segmentos = list(zip(melhor[conexoes[:, 0]], melhor[conexoes[:, 1]]))
-        intersecoes = sum(
-            1 for i, s1 in enumerate(segmentos)
-            for j, s2 in enumerate(segmentos)
-            if i < j and self.segmentos_se_cruzam(*s1, *s2)
-        )
-        print(f"- Interseções: {intersecoes}")
+        return melhor
 
-        print(f"- Peso estimado: {len(conexoes)*0.3:.2f} kg")
-        return melhor, conexoes, historico
-
-    def restricoes_geometricas_fsae(self, nos: np.ndarray, componentes: dict) -> float:
-        penalidade = 0
-        
-        for name, points in componentes.items():
-            for pt in points:
-                dists = np.linalg.norm(nos - pt, axis=1)
-                if np.min(dists) > 0.1:
-                    penalidade += 1e6
-                    
-        y_coords = nos[:,1]
-        comprimento = np.max(y_coords) - np.min(y_coords)
-        if not (1.5 <= comprimento <= 2.0):
-            penalidade += 1e6 * abs(comprimento - 1.75)
-            
-        z_mrh = max(nos[self.find_closest_node(nos, pt)][2] for pt in componentes['main_roll_hoop'][:2])
-        if z_mrh < 0.75:
-            penalidade += 1e6 * (0.75 - z_mrh)
-            
-        x_max = np.max(np.abs(nos[:,0]))
-        if x_max > 0.6:
-            penalidade += 1e6 * (x_max - 0.6)
-            
-        return penalidade
-
-def contar_componentes(n: int, conexoes: List[Tuple[int, int]]) -> int:
-    adj = [[] for _ in range(n)]
-    for u, v in conexoes:
-        adj[u].append(v)
-        adj[v].append(u)
-    
-    visitado = [False] * n
-    componentes = 0
-    
-    def dfs(v):
-        visitado[v] = True
-        for vizinho in adj[v]:
-            if not visitado[vizinho]:
-                dfs(vizinho)
-    
-    for i in range(n):
-        if not visitado[i]:
-            componentes += 1
-            dfs(i)
-    
-    return componentes
-
-def avaliador_fsae(nos: np.ndarray, conexoes: list) -> Tuple[float, float, float, float]:
-    geometria = Estrutura(conexoes, nos)
-    _, _, _, _, _, KT, KF, _, _ = geometria.shape_fun()
-    
-    KT_min = 1e8
-    KF_min = 1e8
-    pen = 0
-    
-    if KT < KT_min:
-        pen += 1e6 * ((KT_min - KT) / KT_min)**2
-    if KF < KF_min:
-        pen += 1e6 * ((KF_min - KF) / KF_min)**2
-        
-    fitness = (1/KT) + (1/KF)
-    return fitness, KT, KF, pen
-
+    def plotar(self, individuo):
+        nodes, elements = individuo
+        fig = plt.figure(figsize=(10, 6))
+        ax = fig.add_subplot(111, projection='3d')
+        x, y, z = [n[0] for n in nodes], [n[1] for n in nodes], [n[2] for n in nodes]
+        ax.scatter(y, x, z, c='r', s=50)
+        for i, j in elements:
+            if i-1 < len(nodes) and j-1 < len(nodes):
+                ni, nj = nodes[i-1], nodes[j-1]
+                ax.plot([ni[1], nj[1]], [ni[0], nj[0]], [ni[2], nj[2]], 'b-')
+        ax.set_xlabel('Y'); ax.set_ylabel('X'); ax.set_zlabel('Z')
+        plt.title("Chassi Evoluído (DE)")
+        plt.show()
 if __name__ == "__main__":
-    parametros = {
-        "avaliador": avaliador_fsae,
-        "pop_size": 5,
-        "F": 0.85,
-        "CR": 0.8,
-        "geracoes": 10,
-        "dist_minima": 0.15,
-        "dist_maxima_conexao": 0.5
-    }
-    
-    otimizador = Estrutura3DEvolutiva(**parametros)
-    melhor_estrutura, conexoes, historico = otimizador.evoluir()
-    otimizador.plotar_estrutura(melhor_estrutura, conexoes)
-    
-    plt.plot(historico)
-    plt.title("Convergência do Algoritmo")
-    plt.xlabel("Geração")
-    plt.ylabel("Melhor Fitness")
-    plt.show()
+    chassi = ChassiDE()
+    melhor_ind = chassi.evoluir()
+    chassi.plotar(melhor_ind)
+
+    m, f, t = chassi.avaliar(melhor_ind)
+    print(f"\nMelhor solução:")
+    print(f"- Massa: {m:.1f} kg")
+    print(f"- Frequência fundamental: {f:.1f} Hz")
+    print(f"- Tensão máxima: {t/1e6:.1f} MPa")
