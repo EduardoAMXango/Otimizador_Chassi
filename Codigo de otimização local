@@ -8,8 +8,8 @@ class ChassiDE:
     def __init__(
         self,
         n_nodes=40,
-        pop_size=25,
-        ngen=60,
+        pop_size=5,
+        ngen=25,
         F=0.8,
         CR=0.7,
         min_dist=0.15,
@@ -82,12 +82,22 @@ class ChassiDE:
                 'cockpit': (0.5, 1.5),
                 'traseira': (1.5, 2.0)
             }[zona]
-            y = random.uniform(*y_range)
-            z_jitter = random.uniform(-0.1, 0.1)
-            x_jitter = random.uniform(0.0, 0.05)
 
-            x = random.uniform(0.1, self.MAX_X - x_jitter)
-            z = random.uniform(-0.1, self.MAX_Z - z_jitter)
+            x_range = {
+                'dianteira': (0.0, 0.25),
+                'cockpit': (0.0, 0.35),
+                'traseira': (0.0, 0.25)
+            }[zona]
+
+            z_range = {
+                'dianteira': (0.0, 0.5),
+                'cockpit': (0.0, 1.0),
+                'traseira': (0.0, 0.6)
+            }[zona]
+            
+            y = random.uniform(*y_range)
+            x = random.uniform(*x_range)
+            z = random.uniform(*z_range)
             nodes.append([x, y, z])
             nodes.append([-x, y, z])
 
@@ -166,7 +176,18 @@ class ChassiDE:
         for t, m in zip(target[0], mutant[0]):
             trial_nodes.append(m if random.random() < self.CR else t)
         return [trial_nodes, target[1]]
-
+    
+    def penalizar_triangular(self, elements):
+        neigh = defaultdict(set)
+        for i, j in elements:
+            neigh[i].add(j)
+            neigh[j].add(i)
+        pen = 0
+        for i, j in elements:
+            if len(neigh[i].intersection(neigh[j])) == 0:
+                pen += 1e3  # penalidade por aresta sem triângulo
+        return pen
+    
     def avaliar(self, individuo):
         pen = 0
         nodes, elements = individuo
@@ -193,10 +214,16 @@ class ChassiDE:
                 and np.isclose(n1[1:], n2[1:], atol=0.05).all()
             ):
                 pen += 1e4
+
         # comprimento longitudinal
         y_coords = [n[1] for n in nodes]
         if max(y_coords) - min(y_coords) < 1.6 or max(y_coords) - min(y_coords) > 2.0:
             pen += 1e6
+
+        # penalidade de triangulação e conectividade
+        pen += sum(1e4 for c in defaultdict(int, {i:sum(1 for e in elements if i in e) for i in range(len(nodes))}).values() if c<3)
+        pen += self.penalizar_triangular(elements)
+
         # conectividade e comprimento de elementos
         conex = [0] * len(nodes)
         for i, j in elements:
