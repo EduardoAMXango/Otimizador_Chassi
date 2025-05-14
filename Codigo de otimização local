@@ -8,8 +8,8 @@ class ChassiDE:
     def __init__(
         self,
         n_nodes=40,
-        pop_size=5,
-        ngen=25,
+        pop_size=50,
+        ngen=3000,
         F=0.8,
         CR=0.7,
         min_dist=0.15,
@@ -194,7 +194,7 @@ class ChassiDE:
         estrutura = Estrutura(elements, nodes)
         estrutura.matrizes_global()
         _,_,_,_,_,KT,KF,_,_ = estrutura.shape_fun()
-        _, _, freq = estrutura.modal_analysis()
+        #_, _, freq = estrutura.modal_analysis()
         fixed_dofs = []
         F_global = np.zeros(estrutura.num_dofs)
         F_global[6*4 + 1] = 3000
@@ -204,7 +204,7 @@ class ChassiDE:
         von_mises = estrutura.compute_von_mises(stresses)
         massa = estrutura.mass()
 
-        pen+=penalidade_chassi(KT,KF,massa,0)
+        pen+=penalidade_chassi(KT,KF,massa,von_mises)
 
         # simetria
         for i in range(0, len(nodes), 2):
@@ -288,8 +288,9 @@ def penalidade_chassi(KT, KF, massa, tensoes):
     KF_min = 1e6
     massa_ideal = 23
     K_mola = 5e5
-    lambdaP = 20  # Penalidade maior
-
+    lambdaP = 1  # Penalidade maior
+    tensao_min= min(tensoes) 
+    tensao_max= max(tensoes)
     penalidade_total = 0
 
     if KT < KT_min:
@@ -299,7 +300,9 @@ def penalidade_chassi(KT, KF, massa, tensoes):
     if massa > massa_ideal:
         penalidade_total += lambdaP * ((massa - massa_ideal) / massa_ideal) ** 2
     if K_mola > 25*KF or K_mola > 25*KT:
-        penalidade_total += 1e5  # Penalidade fixa severa
+        penalidade_total += 1e5  # Penalidade fixa 
+    if tensao_min !=tensao_max and tensao_max>0:
+        penalidade_total += ((tensao_max-tensao_min)/tensao_min)**2
 
     return (penalidade_total)
 
