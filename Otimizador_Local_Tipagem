@@ -1,14 +1,13 @@
 """
 Codigo com a capacidade de varia a quantidade de nós e integração da tipagem dos tubos
 """
-
-
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.spatial import cKDTree
 from Estrutura_Tipada import Estrutura
 import random
 from collections import defaultdict
+import traceback
 
 class ChassiDE:
     def __init__(
@@ -296,20 +295,30 @@ class ChassiDE:
             return 1e6  # Deve haver exatamente 1 Main Hoop conectado
 
         return 0  # Tudo certo
-  
+    
+    def remover_elementos_duplicados(self,elements):
+        vistos = set()
+        unicos = []
+        for i, j, atr in elements:
+            chave = tuple(sorted((i, j)))  # (menor, maior)
+            if chave not in vistos:
+                vistos.add(chave)
+                unicos.append((i, j, atr))
+        return unicos  
+    
     def avaliar(self, individuo):
         pen = 0
         nodes, elements = individuo
 
         # Verifica se há nós e elementos
         if not nodes or not elements:
-            return 1e9, None, None, None
+            return 9e9, None, None, None
 
         # Validação das coordenadas
         try:
             self.validar_coordenadas(nodes)
         except ValueError:
-            return 2e9, None, None, None
+            return 8e9, None, None, None
 
         # Remove elementos inválidos: fora do range, loops, duplicados
         num_nodes = len(nodes)
@@ -318,10 +327,18 @@ class ChassiDE:
             if 0 <= i < num_nodes and 0 <= j < num_nodes and i != j
         ]
         #elements = list(set(tuple(sorted(e)) for e in elements))
+        num_nodes = len(nodes)
+        elements = [
+            (i, j, atr) for i, j, atr in elements
+            if 0 <= i < num_nodes and 0 <= j < num_nodes and i != j
+        ]
+
+        # >>> REMOVE ELEMENTOS DUPLICADOS
+        elements = self.remover_elementos_duplicados(elements)
 
         # Se não há elementos válidos, retorna penalidade máxima
         if len(elements) == 0:
-            return 3e9, None, None, None
+            return 7e9, None, None, None
 
         # --- Validação da distribuição por zonas FSAE ---
         y_coords = [n[1] for n in nodes]
@@ -341,8 +358,8 @@ class ChassiDE:
         for i, j,_ in elements:
             ni, nj = nodes[i], nodes[j]
             d = np.linalg.norm(np.array(ni) - np.array(nj))
-            if d < 1e-6:
-                return 4e9, None, None, None
+            if d < 1e-4:
+                return 6e9, None, None, None
 
         # Penalidade por violar requisitos FSAE (geometria estrutural)
         pen += self.verificar_requisitos_fsae(nodes, elements)
@@ -351,15 +368,15 @@ class ChassiDE:
         # Monta a estrutura
         estrutura = Estrutura(elements, nodes)
         try:
-            estrutura.matrizes_global()
+            K_global,M_global=estrutura.matrizes_global()
         except Exception:
             return 5e9, None, None,None
 
         try:
-            fixed_dofs = [0 * 6 + i for i in range(6)]
-            F_global = np.zeros(estrutura.num_dofs)
-            F_global[0 * 4 + 0] = 300
-            F_global[0 * 5 + 2] = 300
+            fixed_dofs = [0,1,2,3,4,5]
+            F_global = np.zeros(K_global.size)
+            F_global[1*6 + 1] = 300
+            F_global[2*6 + 1] = 300
 
             deslocamentos = estrutura.static_analysis(F_global, fixed_dofs)
             stresses = estrutura.compute_stress(
@@ -369,9 +386,11 @@ class ChassiDE:
             von_mises = estrutura.compute_von_mises(stresses)
             massa = estrutura.mass()
 
-            _, _, _, _, _, KT, KF, _, _ = estrutura.shape_fun()
-        except Exception:
-            return 6e9, None, None, None
+            _, _, _, _, _, KT, KF, _, _ = estrutura.shape_fun(1000,1000,1000,1000)
+        except Exception as e:
+            print(f"Erro durante a análise estática: {str(e)}")
+            traceback.print_exc()
+            return 4e9, None, None, None
 
         # Penalidade de rigidez, tensões e massa
         pen += penalidade_chassi(KT, KF, massa, von_mises)
@@ -392,7 +411,7 @@ class ChassiDE:
 
         # Penalidade de conectividade e comprimento dos elementos
         conex = [0] * len(nodes)
-        for i, j in elements:
+        for i, j,_ in elements:
             ni, nj = nodes[i], nodes[j]
             d = np.linalg.norm(np.array(ni) - np.array(nj))
             if d < self.MIN_DIST or d > self.MAX_DIST:
