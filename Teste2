@@ -6,7 +6,6 @@ import traceback
 from Estrutura_Tipada import Estrutura
 import matplotlib.pyplot as plt
 
-
 class ChassisDEOptimizer:
     def __init__(
         self,
@@ -16,7 +15,6 @@ class ChassisDEOptimizer:
         F: float = 0.5,
         CR: float = 0.9,
         max_generations: int = 200,
-        var_slots_per_side: int = 10,
         k_neighbors: int = 3
     ):
         """
@@ -24,7 +22,7 @@ class ChassisDEOptimizer:
         - mandatory_bases: array de forma (21, 3), coordenadas dos 21 nós de um lado.
         - mandatory_connections: lista de tuplas (i, j) que representam conexões obrigatórias
           entre nós (índices referenciando mandatory_bases).
-        - pop_size, F, CR, max_generations, var_slots_per_side, k_neighbors: parâmetros de DE.
+        - pop_size, F, CR, max_generations, k_neighbors: parâmetros de DE.
         """
 
         # 1) Nós obrigatórios e número de nós
@@ -39,28 +37,18 @@ class ChassisDEOptimizer:
         self.CR = CR
         self.max_gens = max_generations
 
-        # 3) Slots de nós variáveis (de um lado apenas)
-        self.var_slots = var_slots_per_side
-
-        # 4) Número máximo de nós (incluindo simetria):
-        #    2 * num_mandatory + 2 * var_slots (cada variável gera 2 nós simétricos)
-        self.max_nodes = 2 * self.num_mandatory + 2 * self.var_slots
-        # 5) Número máximo de arestas possíveis via k-vizinhos
+        # 3) Número máximo de nós (incluindo simetria): 
+        #    Pode variar de 21 (todos centrais) a 42 (nenhum central)
+        self.max_nodes = 2 * self.num_mandatory
+        # 4) Número máximo de arestas possíveis via k-vizinhos
         self.max_edges = int(self.max_nodes * self.k / 2)
 
-        # 6) Dimensões do genótipo
+        # 5) Dimensões do genótipo
         self.dim_mand = self.num_mandatory * 3
-        self.dim_var  = self.var_slots * 4
-        self.dim_tube = self.max_edges  # uma variável contínua por aresta a evoluir
-        self.dim_total = self.dim_mand + self.dim_var + self.dim_tube
+        self.dim_tube = self.max_edges
+        self.dim_total = self.dim_mand + self.dim_tube
 
-        # 7) Caixa envolvente (para limitar deslocamento dos nós)
-        minima = np.min(self.mandatory_orig, axis=0)
-        maxima = np.max(self.mandatory_orig, axis=0)
-        self.var_bbox_min = minima - 0.1
-        self.var_bbox_max = maxima + 0.1
-
-        # 8) Perfis de tubo possíveis
+        # 6) Perfis de tubo possíveis
         self.tube_profiles = ['Tubo A', 'Tubo B', 'Tubo C', 'Tubo D']
 
     def reflect_nodes(self, nodes: np.ndarray) -> np.ndarray:
@@ -85,194 +73,138 @@ class ChassisDEOptimizer:
         Garante que cada mand_coords[i] fique dentro da esfera
         de raio 0.05 em torno de self.mandatory_orig[i].
         """
-        orig = self.mandatory_orig  # shape (num_mandatory,3)
-        delta = mand_coords - orig  # deslocamentos atuais
-        norms = np.linalg.norm(delta, axis=1, keepdims=True)  # (num_mandatory,1)
-        mask = (norms > 0.05)  # quem está fora do raio
+        orig = self.mandatory_orig
+        delta = mand_coords - orig
+        norms = np.linalg.norm(delta, axis=1, keepdims=True)
+        mask = (norms > 0.05)
 
-        # previne divisão por zero (norms==0), mas só vamos usar delta/norms onde mask==True
-        # calcula deslocamento projetado na fronteira da esfera
         delta_proj = (delta / norms) * 0.05
         mand_coords_adjusted = mand_coords.copy()
         mand_coords_adjusted[mask.flatten()] = (orig + delta_proj)[mask.flatten()]
         return mand_coords_adjusted
-    
-#    def enforce_var_bounds(self, var_coords: np.ndarray) -> np.ndarray:
-#        """Garante que as coordenadas das variáveis fiquem dentro da 'caixa' definida."""
-#        return np.minimum(np.maximum(var_coords, self.var_bbox_min), self.var_bbox_max)
 
-    def validate_min_distance(self, coords, min_dist=0.10):
+    def validate_min_distance(self, coords, min_dist=0.05):
         dists = np.linalg.norm(coords[:, None, :] - coords[None, :, :], axis=2)
         np.fill_diagonal(dists, np.inf)
-        if np.any(dists < min_dist):
-            return False
-        return True
+        return np.all(dists >= min_dist)
 
     def decode_full_individual(self, x: np.ndarray):
-        """
-        Versão revisada de decode_full_individual que garante:
-        1) Nós com x≈0 → não são espelhados (aparecem uma única vez).
-        2) Nós com x>0 → criam par (direito↔esquerdo).
-        3) Conexões obrigatórias e de k-vizinhos são espelhadas de forma 1-a-1.
-        """
         try:
-            # === 1. Nós mandatórios ===
+            # 1. Processamento dos nós mandatórios
             mand_coords = x[:self.dim_mand].reshape((self.num_mandatory, 3))
             mand_coords = self.enforce_mandatory_bounds(mand_coords)
 
             full_list = []
-            mand_map = [(-1, -1)] * self.num_mandatory
+            node_types = {}
 
-            for i in range(self.num_mandatory):
-                coord = mand_coords[i].copy()
+            for i, coord in enumerate(mand_coords):
                 x_val = coord[0]
-
                 if abs(x_val) < 1e-6:
                     idx = len(full_list)
                     full_list.append(coord.tolist())
-                    mand_map[i] = (idx, idx)
+                    node_types[i] = ('central', idx)
                 else:
                     if x_val < 0:
                         coord[0] = -x_val
-
                     idx_right = len(full_list)
                     full_list.append(coord.tolist())
-
-                    mirror = coord.copy()
-                    mirror[0] *= -1
+                    mirrored = coord.copy()
+                    mirrored[0] *= -1
                     idx_left = len(full_list)
-                    full_list.append(mirror.tolist())
-
-                    mand_map[i] = (idx_right, idx_left)
+                    full_list.append(mirrored.tolist())
+                    node_types[i] = ('lateral', (idx_right, idx_left))
 
             nodes = np.array(full_list)
-            num_nodes = nodes.shape[0]
+            num_nodes = len(nodes)
 
-            # === 2. Conexões / elementos ===
+            # 2. Criação das conexões
             elements = []
             used_edges = set()
 
-            # --- 2.1. Arestas obrigatórias ---
-            for (i_orig, j_orig) in self.mandatory_connections:
-                if not (0 <= i_orig < self.num_mandatory and 0 <= j_orig < self.num_mandatory):
+            # Conexões obrigatórias
+            for (i, j) in self.mandatory_connections:
+                if i not in node_types or j not in node_types:
                     continue
+                type_i, ids_i = node_types[i]
+                type_j, ids_j = node_types[j]
+                
+                if type_i == 'central' and type_j == 'central':
+                    elements.append((ids_i, ids_j, 'Tubo A'))
+                elif type_i == 'lateral' and type_j == 'lateral':
+                    elements.append((ids_i[0], ids_j[0], 'Tubo A'))
+                    elements.append((ids_i[1], ids_j[1], 'Tubo A'))
+                else:
+                    if type_i == 'central':
+                        central_idx = ids_i
+                        lateral_idx = ids_j
+                    else:
+                        central_idx = ids_j
+                        lateral_idx = ids_i
+                    elements.append((central_idx, lateral_idx[0], 'Tubo A'))
+                    elements.append((central_idx, lateral_idx[1], 'Tubo A'))
 
-                (ri, li) = mand_map[i_orig]
-                (rj, lj) = mand_map[j_orig]
-
-                def try_add_edge(u, v, profile='Tubo A'):
-                    if u < 0 or v < 0 or u >= num_nodes or v >= num_nodes:
-                        return
-                    a, b = min(u, v), max(u, v)
-                    if (a, b) not in used_edges:
-                        used_edges.add((a, b))
-                        elements.append((a, b, profile))
-
-                if ri != -1 and rj != -1:
-                    try_add_edge(ri, rj, 'Tubo A')
-                if li != -1 and lj != -1:
-                    try_add_edge(li, lj, 'Tubo A')
-
-            # --- 2.2. Arestas por k-vizinhos (apenas no lado esquerdo) ---
-            left_side_indices = [idx for idx, coord in enumerate(nodes) if coord[0] <= 0]
-            if len(left_side_indices) > 1:
-                left_nodes_coords = nodes[left_side_indices]
-                dists = np.linalg.norm(
-                    left_nodes_coords[:, np.newaxis, :] - left_nodes_coords[np.newaxis, :, :],
+            # Conexões por k-vizinhos
+            if num_nodes > 1:
+                dist_matrix = np.linalg.norm(
+                    nodes[:, np.newaxis, :] - nodes[np.newaxis, :, :], 
                     axis=2
                 )
+                np.fill_diagonal(dist_matrix, np.inf)
+                
+                for i in range(num_nodes):
+                    nearest = np.argsort(dist_matrix[i])[:self.k]
+                    for j in nearest:
+                        edge = (min(i, j), max(i, j))
+                        if edge not in used_edges:
+                            used_edges.add(edge)
+                            elements.append((i, j, None))
 
-                for local_i, global_i in enumerate(left_side_indices):
-                    cand = [k for k in range(len(left_side_indices)) if k != local_i]
-                    sorted_locals = sorted(cand, key=lambda k: dists[local_i, k])
-                    nearest_locals = sorted_locals[:self.k]
-
-                    for nl in nearest_locals:
-                        global_j = left_side_indices[nl]
-                        a, b = min(global_i, global_j), max(global_i, global_j)
-                        if (a, b) in used_edges:
-                            continue
-
-                        used_edges.add((a, b))
-                        elements.append((a, b, None))
-
-                        # Espelha no lado direito
-                        def get_right(idx):
-                            for m in range(self.num_mandatory):
-                                if mand_map[m][1] == idx or mand_map[m][0] == idx:
-                                    return mand_map[m][0]
-                            return None
-
-                        ri = get_right(a)
-                        rj = get_right(b)
-                        if ri is not None and rj is not None:
-                            c, d = min(ri, rj), max(ri, rj)
-                            if (c, d) not in used_edges:
-                                used_edges.add((c, d))
-                                elements.append((c, d, None))
-
-            # --- 2.3. Perfis de tubo ---
-            tube_vars = x[self.dim_mand : self.dim_total]
-            all_edges = sorted(used_edges)
-            edge_to_index = { edge: idx for idx, edge in enumerate(all_edges) }
-
-            new_elements = []
-            for (i, j, perfil) in elements:
-                if perfil is not None:
-                    new_elements.append((i, j, perfil))
-                else:
-                    key = (min(i, j), max(i, j))
-                    idx_edge = edge_to_index[key]
-                    if idx_edge < self.max_edges:
-                        tval = tube_vars[idx_edge]
-                        t_int = int(np.floor(np.clip(tval, 0.0, 3.999)))
-                        t_str = self.tube_profiles[t_int]
+            # Atribuição de perfis de tubo
+            tube_vars = x[self.dim_mand:self.dim_total]
+            for idx, (i, j, profile) in enumerate(elements):
+                if profile is None:
+                    if idx < len(tube_vars):
+                        tval = tube_vars[idx]
+                        t_int = int(np.clip(tval, 0, 3.999))
+                        elements[idx] = (i, j, self.tube_profiles[t_int])
                     else:
-                        t_str = self.tube_profiles[0]
-                    new_elements.append((i, j, t_str))
+                        elements[idx] = (i, j, self.tube_profiles[0])
 
-            return nodes, new_elements
+            return nodes, elements
 
         except Exception as e:
             print(f"[ERRO] decode_full_individual: {e}")
             traceback.print_exc()
-            raise
-   
+            raise  
+    
     def initialize_individual(self) -> np.ndarray:
-        # 1) Nós mandatórios: deslocamento uniforme dentro da bola raio 0.05
-        deltas = self.random_point_in_ball(0.05, self.num_mandatory)  # (num_mandatory,3)
-        mand_shifted = self.mandatory_orig + deltas  # garante ||deltas|| <= 0.05
-        mand_flat = mand_shifted.reshape(-1)
-
-        # 3) Tubos (inicialização aleatória, inalterado)
-        tube_flat = np.random.uniform(0.0, 4.0, size=(self.max_edges,))
-        
-        return np.concatenate([mand_flat, tube_flat])
-
+        while True:
+            # Gera deslocamentos aleatórios dentro da bola de raio 0.05
+            deltas = self.random_point_in_ball(0.05, self.num_mandatory)
+            mand_shifted = self.mandatory_orig + deltas
+            
+            # Decodifica para verificar as restrições
+            test_genome = np.concatenate([mand_shifted.reshape(-1), np.zeros(self.dim_tube)])
+            nodes, _ = self.decode_full_individual(test_genome)
+            #print(nodes)
+            # Verifica a distância mínima
+            if self.validate_min_distance(nodes):
+                # Se válido, gera os parâmetros de tubo e retorna
+                tube_flat = np.random.uniform(0.0, 4.0, size=(self.max_edges,))
+                return np.concatenate([mand_shifted.reshape(-1), tube_flat])
+            
     def initialize_population(self):
-        print("População Iniciada", flush=True)
-
+        print("População Iniciada")
         pop = np.zeros((self.pop_size, self.dim_total))
         fitness = np.zeros(self.pop_size)
 
         for i in range(self.pop_size):
-            # Gera até achar um indivíduo que satisfaça as duas condições
             while True:
                 indiv = self.initialize_individual()
-                nodes_i, _ = self.decode_full_individual(indiv)
-                n = len(nodes_i)
-
-                # Verifica número de nós E distância mínima
-                if 42 <= n <= 60 and self.validate_min_distance(nodes_i, 0.15):
-                    break
-                # Se falhar, repete o loop gerando outro `indiv`
-                # (aqui você pode imprimir algo para debug, se quiser)
-                # e volta ao while True
-
+                break
             pop[i, :] = indiv
             fitness[i] = self.evaluate(indiv)
-
-        print("População Finalizada", flush=True)
+        print("População Criada")
         return pop, fitness
 
     def evaluate(self, x: np.ndarray) -> float:
@@ -283,49 +215,19 @@ class ChassisDEOptimizer:
         3) Monta e analisa estrutura via classe Estrutura.
         4) Penaliza rigidez, tensões e massa.
         """
-        print("Avaliação Iniciada" ,end="\r")
+        #print("Avaliação Iniciada" ,end="\r")
         nodes, elements = self.decode_full_individual(x)
         # 1) Se qualquer mandatório estiver fora da esfera 0.05, reject (mas apply_bounds já corrige)
         mand_coords = x[: self.dim_mand].reshape(self.num_mandatory, 3)
         mand_proj = self.enforce_mandatory_bounds(mand_coords)
+        cost=0
         if not np.allclose(mand_coords.reshape(-1), mand_proj.reshape(-1)):
             return float('inf')
 
         # 2) Verifica distância mínima 0.15
-        if not self.validate_min_distance(nodes, 0.15):
+        if not self.validate_min_distance(nodes, 0.05):
             return float('inf')
-
-        # ... resto da avaliação (graus, desconexão, análise estrutural) inalterado ...
-        N = nodes.shape[0]
-        cost = 0.0
-        adj = [[] for _ in range(N)]
-        for (i, j, _) in elements:
-            adj[i].append(j)
-            adj[j].append(i)
-
-        penalty_degree = 0.0
-        for idx in range(N):
-            deg = len(adj[idx])
-            if deg < 3:
-                penalty_degree += (3 - deg) ** 2 * 1000.0
-
-        visited = [False] * N
-        components = 0
-        for idx in range(N):
-            if not visited[idx]:
-                components += 1
-                stack = [idx]
-                while stack:
-                    u = stack.pop()
-                    if not visited[u]:
-                        visited[u] = True
-                        for v in adj[u]:
-                            if not visited[v]:
-                                stack.append(v)
-        penalty_disconnect = 0.0
-        if components > 1:
-            penalty_disconnect = (3-components)**2 *1000
-
+        
         estrutura = Estrutura(elements, nodes)
         estrutura.matrizes_global()
 
@@ -345,10 +247,8 @@ class ChassisDEOptimizer:
         _, _, _, _, _, KT, KF, _, _ = estrutura.shape_fun()
 
         cost += penalidade_chassi(KT, KF, massa, von_mises)
-        cost += penalty_degree + penalty_disconnect
-
         return cost
-
+    
     def mutate_and_crossover(self, target_idx: int, pop: np.ndarray) -> np.ndarray:
         idxs = list(range(self.pop_size))
         idxs.remove(target_idx)
@@ -371,27 +271,23 @@ class ChassisDEOptimizer:
 
         u = self.apply_bounds(u_candidate)
 
-        # (Re)verifica número de nós e distância mínima:
+        # VALIDAÇÃO DIRETA DAS RESTRIÇÕES DURANTE A CRIAÇÃO
         nodes_u, _ = self.decode_full_individual(u)
-        if (not self.verify_num_nodes(u)) or (not self.validate_min_distance(nodes_u, 0.15)):
-            # Se inválido, retorna o indivíduo original sem mudança
+        if not self.validate_min_distance(nodes_u):
             return x_i.copy()
         return u
 
     def apply_bounds(self, u: np.ndarray) -> np.ndarray:
-        # Mandatórios: projeta na bola
+        # Aplica limites aos nós mandatórios
         mand_try = u[: self.dim_mand].reshape(self.num_mandatory, 3)
         mand_try = self.enforce_mandatory_bounds(mand_try)
         mand_try_flat = mand_try.reshape(-1)
 
-        # Tubos: mesma escala [0,3.999]
-        tube_try = u[self.dim_mand + self.dim_var : self.dim_total]
-        tube_try = np.minimum(np.maximum(tube_try, 0.0), 3.999)
+        # Aplica limites aos tubos
+        tube_try = u[self.dim_mand :]
+        tube_try = np.clip(tube_try, 0.0, 3.999)
 
         return np.concatenate([mand_try_flat, tube_try])
-
-    def verify_num_nodes(self, x):
-        return (42 <= x <= 60)
 
     def plotar(self, individuo):
         nodes, elements = individuo
@@ -406,12 +302,11 @@ class ChassisDEOptimizer:
         for i, j, t in elements_valid:
             ni, nj = nodes[i], nodes[j]
             ax.plot([ni[1], nj[1]], [ni[0], nj[0]], [ni[2], nj[2]], 'b-')
-            # t é string do tipo de tubo (ex: 'Tubo A')
         ax.set_xlabel('Y')
         ax.set_ylabel('X')
         ax.set_zlabel('Z')
         ax.set_box_aspect([3,1,2])
-        plt.title("Chassi Evoluído (DE com Tipos de Tubo)")
+        plt.title("Chassi Evoluído")
         plt.show()
 
     def optimize(self):
@@ -422,24 +317,20 @@ class ChassisDEOptimizer:
             trial_vectors = [None] * self.pop_size
             trial_fitness = [None] * self.pop_size
 
-            # 1) Geração e avaliação dos novos candidatos (sem paralelização)
             for i in range(self.pop_size):
                 u = self.mutate_and_crossover(i, pop)
-                if self.verify_num_nodes(u):
-                    f = self.evaluate(u)
-                else:
-                    f = float('inf')
+                f = self.evaluate(u)
                 trial_vectors[i] = u
                 trial_fitness[i] = f
 
-            # 2) Substituição da população
+            # Atualização da população
             for i in range(self.pop_size):
                 if trial_fitness[i] <= fitness[i]:
                     pop[i, :] = trial_vectors[i]
                     fitness[i] = trial_fitness[i]
 
             best_idx = np.argmin(fitness)
-            print(f"Geração {gen+1:03d} | melhor fitness = {fitness[best_idx]:.6e} | ", end="\r")
+            print(f"Geração {gen+1:03d} | melhor fitness = {fitness[best_idx]:.4e}",end="\r")
 
         best_idx = np.argmin(fitness)
         best_vec = pop[best_idx]
@@ -486,16 +377,15 @@ def penalidade_chassi(KT, KF, massa, tensoes):
         penalidade_total += 100 * violacao**2
 
     # 5. Tensões (Abordagem Baseada em Risco)
-    if tensoes:
-        tensao_max = max(tensoes)
-        if tensao_max > tensao_adm:
-            # Penalidade exponencial para tensões acima do admissível
-            excesso = (tensao_max - tensao_adm) / tensao_adm
-            penalidade_total += np.exp(5 * excesso) - 1
-        
-        # Penalidade por distribuição desigual de tensões (logarítmica)
-        razao_tensoes = np.ptp(tensoes) / np.mean(tensoes) if np.mean(tensoes) > 0 else 0
-        penalidade_total += np.log(1 + razao_tensoes)
+    tensao_max = max(tensoes)
+    if tensao_max > tensao_adm:
+        # Penalidade exponencial para tensões acima do admissível
+        excesso = (tensao_max - tensao_adm) / tensao_adm
+        penalidade_total += np.exp(5 * excesso) - 1
+    
+    # Penalidade por distribuição desigual de tensões (logarítmica)
+    razao_tensoes = np.ptp(tensoes) / np.mean(tensoes) if np.mean(tensoes) > 0 else 0
+    penalidade_total += np.log(1 + razao_tensoes)
 
     return penalidade_total * 100  # Fator de escala global
 
@@ -524,7 +414,7 @@ if __name__ == "__main__":
         [0.16, 0.00, 0.42]
     ])
     mandatory_connections = [
-    (0, 1), 
+    (0, 1,), 
     (0, 3), 
     (1, 3), 
     (2, 0), 
@@ -553,18 +443,16 @@ if __name__ == "__main__":
     otimizador = ChassisDEOptimizer(
         mandatory_bases=mandatory_bases,
         mandatory_connections=mandatory_connections,
-        pop_size=5,
+        pop_size=30,
         F=0.6,
         CR=0.8,
-        max_generations=10,
-        var_slots_per_side=10,
-        k_neighbors=3
+        max_generations=200,
+        k_neighbors=4
     )
 
     best_indiv, best_cost = otimizador.optimize()
     print(f"\nMelhor custo: {best_cost:.6e}")
     nodes_final, elements_final = best_indiv
-    print(f"Total de nós: {len(nodes_final)}")
-    print(f"\nTotal de nós: {len(nodes_final)}")
+
     # Plota chassi final
     otimizador.plotar(best_indiv)
