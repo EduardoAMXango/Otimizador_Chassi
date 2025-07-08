@@ -3,7 +3,6 @@ from copy import deepcopy
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import itertools
 import traceback
-from Estrutura_Tipada import Estrutura
 import matplotlib.pyplot as plt
 import os
 import datetime
@@ -33,7 +32,8 @@ class ChassisDEOptimizer:
         radius_mand: float = 0.05,
         radius_opt: float = 0.10,
         use_parallel: bool = True,
-        fixed_tube_indices: dict = None
+        fixed_tube_indices: dict = None,
+        connect_with_mirror: list = None
     ):
         """
         Inicializa o otimizador.
@@ -53,6 +53,7 @@ class ChassisDEOptimizer:
         self.base_nodes = base_nodes.copy()
         self.n = base_nodes.shape[0]
         self.n_tubes = len(base_connections)
+        self.n_espelhos = sum(1 for i in connect_with_mirror or [])
         self.base_connections = base_connections
         self.mandatory = set(mandatory_indices)
         self.radius_mand = radius_mand
@@ -60,6 +61,14 @@ class ChassisDEOptimizer:
 
         self.tipos_tubos = ['Tubo A', 'Tubo B', 'Tubo C', 'Tubo D']
         self.fixed_tube_indices = fixed_tube_indices or {}
+        self.connect_with_mirror = connect_with_mirror or []
+        self.tube_indices_otimizados = [
+            i for i in range(self.n_tubes) if i not in self.fixed_tube_indices
+        ]
+        self.espelhos_otimizados = [
+            i for i in self.connect_with_mirror or [] if f'espelho_{i}' not in self.fixed_tube_indices
+        ]
+        self.dim_tubes = len(self.tube_indices_otimizados) + len(self.espelhos_otimizados)
 
         # DE parameters
         self.pop_size = pop_size
@@ -69,7 +78,9 @@ class ChassisDEOptimizer:
 
         # genotype dimension: coords + tube_vars
         self.dim_coords = 3 * self.n
-        self.dim_tubes = self.n_tubes
+        opt_tubes = sum(1 for i in range(self.n_tubes) if i not in self.fixed_tube_indices)
+        opt_tubes += sum(1 for i in self.connect_with_mirror if f'espelho_{i}' not in self.fixed_tube_indices)
+        self.dim_tubes = opt_tubes
         self.dim = self.dim_coords + self.dim_tubes
 
     def reflect_nodes(self, nodes: np.ndarray) -> np.ndarray:
@@ -154,34 +165,48 @@ class ChassisDEOptimizer:
 
         # Monta conexões com tipo de tubo simétrico
         elements = []
+        tube_idx_counter = 0  # Contador para as tube_vars
         for idx_conn, (i, j) in enumerate(self.base_connections):
-            # determina perfil a partir de tube_vars
             if idx_conn in self.fixed_tube_indices:
                 perfil = self.fixed_tube_indices[idx_conn]
             else:
-                tval = tube_vars[idx_conn]
+                tval = tube_vars[tube_idx_counter]
                 t_int = int(np.clip(np.floor(tval), 0, len(self.tipos_tubos) - 1))
                 perfil = self.tipos_tubos[t_int]
+                tube_idx_counter += 1  # Incrementa só se for otimizado
 
-            # combina índices conforme mapeamento
             ids_i = mapping[i]
             ids_j = mapping[j]
-            # se ambos centrais
+
             if len(ids_i) == 1 and len(ids_j) == 1:
                 elements.append((ids_i[0], ids_j[0], perfil))
-            # se ambos laterais, conecta pares correspondentes
             elif len(ids_i) == 2 and len(ids_j) == 2:
                 elements.append((ids_i[0], ids_j[0], perfil))
                 elements.append((ids_i[1], ids_j[1], perfil))
-            # se um central e outro lateral, conecta central a ambos
             else:
-                # identifica qual é central
-                if len(ids_i) == 1:
-                    cent = ids_i[0]; lats = ids_j
-                else:
-                    cent = ids_j[0]; lats = ids_i
+                cent = ids_i[0] if len(ids_i) == 1 else ids_j[0]
+                lats = ids_j if len(ids_i) == 1 else ids_i
                 for lat in lats:
                     elements.append((cent, lat, perfil))
+
+        # Conexões (nó, espelho)
+        for i in self.connect_with_mirror:
+            if i in mapping and len(mapping[i]) == 2:
+                idx1, idx2 = mapping[i]
+
+                key = f'espelho_{i}'
+                if key in self.fixed_tube_indices:
+                    perfil = self.fixed_tube_indices[key]
+                else:
+                    if tube_idx_counter < len(tube_vars):
+                        tval = tube_vars[tube_idx_counter]
+                        t_int = int(np.clip(np.floor(tval), 0, len(self.tipos_tubos) - 1))
+                        perfil = self.tipos_tubos[t_int]
+                        tube_idx_counter += 1
+                    else:
+                        perfil = self.tipos_tubos[0] 
+
+                elements.append((idx1, idx2, perfil))
 
         return nodes_full, elements
 
@@ -214,10 +239,18 @@ class ChassisDEOptimizer:
             coords = self.base_nodes + deltas
             coords = self.enforce_bounds(coords)
             # tube_vars iniciais aleatórios entre [0,4)
-            tube_vars = np.random.uniform(0, len(self.tipos_tubos), size=(self.n_tubes,))
+            tube_vars = np.random.uniform(0, len(self.tipos_tubos), size=(self.dim_tubes,))
+            tube_var_idx = 0  # índice no vetor tube_vars
+
+            # Aplica fixos para conexões normais
             for idx, tipo in self.fixed_tube_indices.items():
-                t_idx = self.tipos_tubos.index(tipo)
-                tube_vars[idx] = t_idx + 0.01  # pequeno offset para não arredondar para o próximo
+                if isinstance(idx, int):  # conexões normais
+                    continue  # já tratado no decode_individual
+
+            for idx, tipo in self.fixed_tube_indices.items():
+                if isinstance(idx, int):  # só atribui se o índice for de conexão normal
+                    t_idx = self.tipos_tubos.index(tipo)
+                    tube_vars[idx] = t_idx + 0.01
 
             x = np.concatenate([coords.reshape(-1), tube_vars])
             nodes, _ = self.decode_individual(x)
@@ -301,8 +334,9 @@ class ChassisDEOptimizer:
         coords = self.enforce_bounds(u[:self.dim_coords].reshape(self.n,3)).reshape(-1)
         tube_vars = np.clip(u[self.dim_coords:], 0, len(self.tipos_tubos)-1e-3)
         for idx, tipo in self.fixed_tube_indices.items():
-            t_idx = self.tipos_tubos.index(tipo)
-            tube_vars[idx] = t_idx + 0.01
+            if isinstance(idx, int):  # Apenas conexões normais
+                t_idx = self.tipos_tubos.index(tipo)
+                tube_vars[idx] = t_idx + 0.01
         u = np.concatenate([coords, tube_vars])
         # valida distância
         if self.validate_min_distance(self.decode_individual(u)[0]):
@@ -566,48 +600,97 @@ def penalidade_chassi(KT, KF, massa, tensoes):
     return penalidade_total * 100  # Fator de escala global
 
 if __name__ == "__main__":
-    nodes = np.array([
-    [0.32, 1.92, 0.0],    #0
-    [0.32, 1.92, 0.48],   #1
-    [0.32, 1.77, 0.21],   #2
-    [0.32, 1.5, 0.03],    #3
-    [0.28, 1.14, 0.03],   #4
-    [0.32, 1.14, 0.09],   #5
-    [0.32, 1.23, 0.36],   #6
-    [0.28, 1.14, 0.72],   #7
-    [0.32, 0.63, 0.54],   #8
-    [0.32, 0.69, 0.24],   #9
-    [0.32, 0.69, 0.0],    #10
-    [0.32, 0.45, 0.21],   #11
-    [0.28, 0.24, 0.09],   #12
-    [0.16, 0.0, 0.21],    #13
-    [0.16, 0.0, 0.09],    #14
-    [0.16, 0.0, 0.42],    #15
-    [0.28, 0.33, 0.66],   #16
-    [0.28, 0.57, 1.2],    #17
-    [0.0, 0.54, 1.35],    #18
-    [0.0, 1.14, 0.78],     #19
-    [0.00, 1.92, 0.0],    #20
-    [0.00, 1.92, 0.48],   #21
-    [0.00, 0.33, 0.66],   #22
-])
+    nodes = np.array([[0.145,  0.000,	0.445],  #00* 
+[0.145,  0.000,	0.155],  #01* 
+[0.215,  0.465,	0.280],  #02
+[0.215,  0.465,	0.070],  #03* 
+[0.175,  0.670,	0.520],  #04
+[0.210,  0.670,	0.270],  #05
+[0.230,  0.865,	0.080],  #06* 
+[0.220,  0.865,	0.275],  #07
+[0.185,  0.865,	0.480],  #08
+[0.185,  0.865,	0.555],  #09
+[0.095,  0.865,	0.600],  #10*
+[0.380,  1.205,	0.000],  #11*
+[0.380,  1.605,	0.265],  #12
+[0.390,  1.605,	0.000],  #13*
+[0.380,  1.755,	0.265],  #14
+[0.390,  1.755,	0.000],  #15*
+[0.370,  2.055,	0.270],  #16
+[0.395,  2.055,	0.000],  #17
+[0.255,  2.400,	0.000],  #18*
+[0.255,  2.245,	0.000],  #19*
+[0.255,  2.400,	0.265],  #20*
+[0.190,  2.260,	0.405],  #21
+[0.130,  1.730,	0.920],  #22
+[0.130,  1.605,	0.920],  #23
+[0.100,  1.605,	1.040],  #24
+[0.000,  1.605,	1.115],  #25
+[0.255,  2.090,	0.270],  #26
+[0.255,  2.090,	0.000]]) #27
 
-    connections = [
-    (0, 1), (0,2),(0,3),(1,7),(0,20),
-    (1,6), (1,2),(0,3),(8,17),(3,6),
-    (3,4), (4,5),(4,10),(1,21),(16,22),
-    (2, 6), (2,3),(0,3),(5,6),(6,9),(6,10),
-    (3,5),(6,7),(7,8),(5,10),(10,12),
-    (8,9),(8,6),(9,10),(11,13),
-    (10,11),(11,12),(11,9),
-    (13, 14), (12,14),(13,15),
-    (7,19),(15,16),(16,17),(8,16),
-    (17,18),(11,16),(8,11),(11,15)
-]
+    connections = ((0,1),
+(0,2),
+(0,4),
+(1,3),
+(1,2),
+(2,4),
+(2,5),
+(2,3),
+(3,5),
+(3,6),
+(4,5),
+(4,7),
+(4,9),
+(5,6),
+(5,7),
+(6,7),
+(6,11),
+(7,8),
+(7,11),
+(7,12),
+(8,9),
+(8,12),
+(9,10),
+(11,12),
+(11,13),
+(12,13),
+(12,14),
+(12,15),
+(12,23),
+(13,15),
+(14,15),
+(14,16),
+(15,16),
+(15,17),
+(16,17),
+(16,26),
+(16,27),
+(17,27),
+(18,27),
+(18,19),
+(18,20),
+(19,20),
+(19,26),
+(19,27),
+(20,21),
+(20,26),
+(21,26),
+(21,22),
+(22,23),
+(22,24),
+(23,24),
+(24,25),
+(26,27))
 
-    fixed_tube={0: "Tubo B",1: "Tubo B",2: "Tubo B"}
+
+    fixed_tube={0: "Tubo B",1: "Tubo B",2: "Tubo B","espelho_0": "Tubo B","espelho_1": "Tubo B"}
+
+    mirror_connections = [0, 1, 3, 6, 10, 11, 13, 15, 18, 19, 20]
 
     indices = [0,1,3,5,6,7,8,10,14,15,16,17,18,19,20,21,22]
+
+
         # Criar diretório para resultados
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     results_dir = f"resultados_otimizacao_{timestamp}"
@@ -617,11 +700,12 @@ if __name__ == "__main__":
         base_nodes= nodes,
         base_connections = connections,
         mandatory_indices = indices,
+        connect_with_mirror = mirror_connections,
         pop_size=10,
         F=0.6,
         CR=0.8,
         max_generations=5,
-        fixed_tube_indices=fixed_tube)
+        fixed_tube_indices = fixed_tube)
 
     best_indiv, best_cost, history = otimizador.optimize()
     print(f"\nMelhor custo: {best_cost:.6e}")
