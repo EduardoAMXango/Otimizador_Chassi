@@ -1,13 +1,21 @@
 import numpy as np
 from copy import deepcopy
 from concurrent.futures import ProcessPoolExecutor, as_completed
-import itertools
 import traceback
+from scipy.spatial.distance import pdist
 import matplotlib.pyplot as plt
 import os
-import datetime
+from datetime import datetime
+import time
 
-class ChassisDEOptimizer:
+def init_worker(optimizer_instance):
+    """
+    Inicializador de cada worker: atribui a instância global OPTIMIZER
+    """
+    global OPTIMIZER
+    OPTIMIZER = optimizer_instance
+
+class ChassisDEOptimizer:   
     """
     Otimizador de geometria de chassi tubular usando Differential Evolution (DE).
 
@@ -29,11 +37,12 @@ class ChassisDEOptimizer:
         F: float = 0.5,
         CR: float = 0.9,
         max_generations: int = 200,
-        radius_mand: float = 0.05,
-        radius_opt: float = 0.10,
+        radius_mand: float = 0.025,
+        radius_opt: float = 0.05,
         use_parallel: bool = True,
-        fixed_tube_indices: dict = None,
-        connect_with_mirror: list = None
+        n_workers: int = None,
+        tubos_fixos: dict = None,
+        connect_with_mirror: list = None,
     ):
         """
         Inicializa o otimizador.
@@ -44,8 +53,6 @@ class ChassisDEOptimizer:
         - mandatory_indices: lista de inteiros.
         - pop_size, F, CR, max_generations: parâmetros DE.
         - radius_mand, radius_opt: floats definindo limites de deslocamento.
-        - use_parallel: bool, se True permitir paralelismo. (não utilizado neste código)
-        - fixed_tube_indices, lista com os indices dos elementos que so podem ser de um tipo de tubo
 
         Retorno:
         - Nenhum (configura atributos internos).
@@ -53,49 +60,62 @@ class ChassisDEOptimizer:
         self.base_nodes = base_nodes.copy()
         self.n = base_nodes.shape[0]
         self.n_tubes = len(base_connections)
-        self.n_espelhos = sum(1 for i in connect_with_mirror or [])
         self.base_connections = base_connections
         self.mandatory = set(mandatory_indices)
         self.radius_mand = radius_mand
         self.radius_opt = radius_opt
 
         self.tipos_tubos = ['Tubo A', 'Tubo B', 'Tubo C', 'Tubo D']
-        self.fixed_tube_indices = fixed_tube_indices or {}
+        self.tubos_fixos = tubos_fixos or {}
         self.connect_with_mirror = connect_with_mirror or []
-        self.tube_indices_otimizados = [
-            i for i in range(self.n_tubes) if i not in self.fixed_tube_indices
-        ]
-        self.espelhos_otimizados = [
-            i for i in self.connect_with_mirror or [] if f'espelho_{i}' not in self.fixed_tube_indices
-        ]
-        self.dim_tubes = len(self.tube_indices_otimizados) + len(self.espelhos_otimizados)
+        self.n_extra_espelhos = len(self.connect_with_mirror)
+        self.total_tubes = self.n_tubes + self.n_extra_espelhos
 
-        # DE parameters
         self.pop_size = pop_size
         self.F = F
         self.CR = CR
         self.max_gens = max_generations
 
-        # genotype dimension: coords + tube_vars
         self.dim_coords = 3 * self.n
-        opt_tubes = sum(1 for i in range(self.n_tubes) if i not in self.fixed_tube_indices)
-        opt_tubes += sum(1 for i in self.connect_with_mirror if f'espelho_{i}' not in self.fixed_tube_indices)
-        self.dim_tubes = opt_tubes
-        self.dim = self.dim_coords + self.dim_tubes
+        self.dim_tubes = self.n_tubes
+        self.dim = self.dim_coords + self.total_tubes
 
-    def reflect_nodes(self, nodes: np.ndarray) -> np.ndarray:
+        self.use_parallel = use_parallel
+        self.n_workers = max(1, os.cpu_count() if n_workers is None else n_workers)
+
+        self.is_central = np.isclose(self.base_nodes[:, 0], 0.0)
+        self.central_alignment_map = self._create_alignment_map()
+
+        self.global_decoded_cache = {}
+        
+    def _create_alignment_map(self,exceptions=[15,20]):
         """
-        Espelha coordenadas de nós no plano x=0.
-
-        Entrada:
-        - nodes: array (m,3) de floats.
-        Saída:
-        - mirrored: array (m,3) onde mirrored[:,0] = -nodes[:,0].
+        Cria um dicionário mapeando cada nó central ao nó lateral que ele deve espelhar.
+        exceptions não são mapeados.
         """
-        mirrored = nodes.copy()
-        mirrored[:, 0] *= -1
-        return mirrored
+        alignment_map = {}
+        central_nodes = [i for i in range(self.n) if self.is_central[i]]
+        for i, j in self.base_connections:
+            if i in central_nodes and not self.is_central[j] and i not in exceptions:
+                alignment_map.setdefault(i, []).append(j)
+            elif j in central_nodes and not self.is_central[i] and j not in exceptions:
+                alignment_map.setdefault(j, []).append(i)
+        return alignment_map
 
+    def apply_central_alignment(self, coords: np.ndarray) -> np.ndarray:
+        """
+        Força nós centrais a terem o mesmo Y e Z dos nós laterais conectados.
+        Para múltiplas conexões, usa a média das coordenadas.
+        """
+        aligned_coords = coords.copy()
+        
+        for central_idx, lateral_indices in self.central_alignment_map.items():
+            aligned_coords[central_idx, 1] = np.mean(coords[lateral_indices, 1])
+            aligned_coords[central_idx, 2] = np.mean(coords[lateral_indices, 2])
+            aligned_coords[central_idx, 0] = 0.0
+            
+        return aligned_coords
+    
     def enforce_bounds(self, coords: np.ndarray) -> np.ndarray:
         """
         Aplica limites de deslocamento e arredonda as coordenadas.
@@ -109,15 +129,37 @@ class ChassisDEOptimizer:
         adjusted = coords.copy()
         for i in range(self.n):
             orig = self.base_nodes[i]
-            delta = coords[i] - orig
-            dist = np.linalg.norm(delta)
-            r_max = self.radius_mand if i in self.mandatory else self.radius_opt
-            if dist > r_max:
-                adjusted[i] = orig + delta / dist * r_max
-        # Arredonda para 3 casas decimais para estabilidade da evolução
-        adjusted = np.round(adjusted, 3)
-        return adjusted
 
+            if self.is_central[i]:
+                adjusted[i, 0] = 0.0
+                delta = coords[i, 1:] - orig[1:]
+                dist = np.linalg.norm(delta)
+                r = self.radius_mand if i in self.mandatory else self.radius_opt
+                if dist > r:
+                    adjusted[i, 1:] = orig[1:] + (delta / dist) * r
+            else:
+                delta = coords[i] - orig
+                dist = np.linalg.norm(delta)
+                r = self.radius_mand if i in self.mandatory else self.radius_opt
+                if dist > r:
+                    adjusted[i] = orig + (delta / dist) * r
+        adjusted[self.is_central, 0] = 0.0
+        return np.round(adjusted, 3)
+ 
+    def validate_min_distance(self, coords: np.ndarray, min_dist: float = 0.05) -> bool:
+        """
+        Verifica se todas as distâncias entre pares de nós são maiores ou iguais a uma distância mínima.
+        Vetorizado usando pdist.
+
+        Parâmetros:
+        - coords: np.ndarray (N, 3), coordenadas dos nós.
+        - min_dist: float, distância mínima permitida.
+
+        Retorno:
+        - bool: True se válido, False se algum par violar a distância mínima.
+        """
+        return np.all(pdist(coords) >= min_dist)
+ 
     def decode_individual(self, x: np.ndarray):
         """
         Converte um vetor genotípico em nós completos e lista de elementos.
@@ -127,32 +169,20 @@ class ChassisDEOptimizer:
         Saída:
         - nodes_full: array (N,3) de floats com nós de ambos os lados.
         - elements: lista de tuplas (i, j, perfil), com índices nos nodes_full.
-
-        Processos:
-        1. Extrai coords e tube_vars do vetor x.
-        2. Aplica enforce_bounds às coords.
-        3. Para nós com base x≈0, inclui apenas um nó (central).
-           Para outros, inclui coord e seu espelho.
-        4. Usa mapeamento para gerar conexões simétricas com tipo de tubo.
         """
-        # Separa coords e tube_vars
         coords = x[:self.dim_coords].reshape((self.n, 3))
+        coords = self.enforce_bounds(coords)
+        coords = self.apply_central_alignment(coords)
         tube_vars = x[self.dim_coords:]
 
-        # Aplica bounds
-        coords = self.enforce_bounds(coords)
-
-        # Monta os nós completos com mapeamento para índices
         full_nodes = []
         mapping = {}
         for i, coord in enumerate(coords):
-            # central: x original == 0
-            if np.isclose(self.base_nodes[i, 0], 0.0):
+            if self.is_central[i]:
                 idx = len(full_nodes)
                 full_nodes.append(coord)
                 mapping[i] = [idx]
             else:
-                # lateral: coordenada e seu espelho
                 idx1 = len(full_nodes)
                 full_nodes.append(coord)
                 mirrored = coord.copy()
@@ -162,68 +192,52 @@ class ChassisDEOptimizer:
                 mapping[i] = [idx1, idx2]
 
         nodes_full = np.array(full_nodes)
-
-        # Monta conexões com tipo de tubo simétrico
         elements = []
-        tube_idx_counter = 0  # Contador para as tube_vars
         for idx_conn, (i, j) in enumerate(self.base_connections):
-            if idx_conn in self.fixed_tube_indices:
-                perfil = self.fixed_tube_indices[idx_conn]
+            if idx_conn in self.tubos_fixos:
+                perfil = self.tubos_fixos[idx_conn]
             else:
-                tval = tube_vars[tube_idx_counter]
+                tval = tube_vars[idx_conn]
                 t_int = int(np.clip(np.floor(tval), 0, len(self.tipos_tubos) - 1))
                 perfil = self.tipos_tubos[t_int]
-                tube_idx_counter += 1  # Incrementa só se for otimizado
 
-            ids_i = mapping[i]
-            ids_j = mapping[j]
-
+            ids_i, ids_j = mapping[i], mapping[j]
             if len(ids_i) == 1 and len(ids_j) == 1:
                 elements.append((ids_i[0], ids_j[0], perfil))
             elif len(ids_i) == 2 and len(ids_j) == 2:
                 elements.append((ids_i[0], ids_j[0], perfil))
                 elements.append((ids_i[1], ids_j[1], perfil))
             else:
-                cent = ids_i[0] if len(ids_i) == 1 else ids_j[0]
-                lats = ids_j if len(ids_i) == 1 else ids_i
+                cent, lats = (ids_i[0], ids_j) if len(ids_i) == 1 else (ids_j[0], ids_i)
                 for lat in lats:
                     elements.append((cent, lat, perfil))
-
-        # Conexões (nó, espelho)
-        for i in self.connect_with_mirror:
-            if i in mapping and len(mapping[i]) == 2:
-                idx1, idx2 = mapping[i]
-
-                key = f'espelho_{i}'
-                if key in self.fixed_tube_indices:
-                    perfil = self.fixed_tube_indices[key]
+        # Conexões espelhadas adicionais (entre cada nó e seu espelho)
+        for i_extra, node_idx in enumerate(self.connect_with_mirror):
+            if node_idx in mapping and len(mapping[node_idx]) == 2:
+                id_a, id_b = mapping[node_idx]
+                key_fixo = f"espelho_{node_idx}"
+                if key_fixo in self.tubos_fixos:
+                    perfil = self.tubos_fixos[key_fixo]
                 else:
-                    if tube_idx_counter < len(tube_vars):
-                        tval = tube_vars[tube_idx_counter]
-                        t_int = int(np.clip(np.floor(tval), 0, len(self.tipos_tubos) - 1))
-                        perfil = self.tipos_tubos[t_int]
-                        tube_idx_counter += 1
-                    else:
-                        perfil = self.tipos_tubos[0] 
-
-                elements.append((idx1, idx2, perfil))
+                    tval = tube_vars[self.n_tubes + i_extra]
+                    t_int = int(np.clip(np.floor(tval), 0, len(self.tipos_tubos) - 1))
+                    perfil = self.tipos_tubos[t_int]
+                elements.append((id_a, id_b, perfil))
 
         return nodes_full, elements
 
-    def validate_min_distance(self, coords, min_dist=0.05):
-        """
-        Verifica se todas as distâncias entre pares de nós >= min_dist.
-
-        Entrada:
-        - coords: array (M,3).
-        - min_dist: float.
-        Saída:
-        - bool, True se válido.
-        """
-        d = np.linalg.norm(coords[:, None, :] - coords[None, :, :], axis=2)
-        np.fill_diagonal(d, np.inf)
-        return np.all(d >= min_dist)
-
+    def decode_population(self, pop):
+        decoded = []
+        for x in pop:
+            key = hash(x.tobytes())
+            if key not in self.global_decoded_cache:
+                nodes, elems = self.decode_individual(x)
+                if not self.validate_min_distance(nodes):
+                    continue
+                self.global_decoded_cache[key] = (nodes, elems)
+            decoded.append(self.global_decoded_cache[key])
+        return decoded 
+   
     def initialize_individual(self) -> np.ndarray:
         """
         Gera um indivíduo válido.
@@ -232,188 +246,201 @@ class ChassisDEOptimizer:
         - x: array (dim,) de floats, contendo coords arredondadas e tube_vars iniciais.
         """
         while True:
-            # Gera coords aleatórias
             deltas = np.random.normal(size=(self.n, 3))
+            deltas[self.is_central, 0] = 0.0
             norms = np.linalg.norm(deltas, axis=1, keepdims=True)
-            deltas = deltas / norms * (np.random.rand(self.n,1) ** (1/3) * self.radius_opt)
-            coords = self.base_nodes + deltas
+            radii = (np.random.rand(self.n, 1) ** (1/3)) * self.radius_opt
+            coords = self.base_nodes + (deltas / norms) * radii
             coords = self.enforce_bounds(coords)
-            # tube_vars iniciais aleatórios entre [0,4)
-            tube_vars = np.random.uniform(0, len(self.tipos_tubos), size=(self.dim_tubes,))
-            tube_var_idx = 0  # índice no vetor tube_vars
-
-            # Aplica fixos para conexões normais
-            for idx, tipo in self.fixed_tube_indices.items():
-                if isinstance(idx, int):  # conexões normais
-                    continue  # já tratado no decode_individual
-
-            for idx, tipo in self.fixed_tube_indices.items():
-                if isinstance(idx, int):  # só atribui se o índice for de conexão normal
-                    t_idx = self.tipos_tubos.index(tipo)
-                    tube_vars[idx] = t_idx + 0.01
-
+            coords = self.apply_central_alignment(coords)
+            tube_vars = np.random.uniform(0, len(self.tipos_tubos), size=(self.total_tubes,))
             x = np.concatenate([coords.reshape(-1), tube_vars])
             nodes, _ = self.decode_individual(x)
-
             if self.validate_min_distance(nodes):
-                #print("Individuo valido" ,end="\r")
                 return x
 
     def initialize_population(self):
-        """
-        Constrói a população inicial.
-
-        Saída:
-        - pop: array (pop_size, dim) de indivíduos.
-        - fitness: array (pop_size,) de floats.
-        """
-        pop = np.zeros((self.pop_size, self.dim))
-        fitness = np.zeros(self.pop_size)
-        for i in range(self.pop_size):
-            indiv = self.initialize_individual()
-            pop[i] = indiv
-            fitness[i] = self.evaluate(indiv)
+        pop = []
+        seen = set()
+        while len(pop) < self.pop_size:
+            x = self.initialize_individual()
+            key = hash(x.tobytes())
+            if key in seen:
+                continue
+            seen.add(key)
+            pop.append(x)
+        pop = np.array(pop)
+        decoded = self.decode_population(pop)
+        nodes_list, elems_list = zip(*decoded)
+        results = self.parallel_evaluate(nodes_list, elems_list)
+        fitness = np.array([res[0] for res in results])
         return pop, fitness
 
-    def evaluate(self, x: np.ndarray) -> float:
-        """
-        Avalia o custo de um indivíduo.
-
-        Entrada:
-        - x: array (dim,) de floats.
-        Saída:
-        - float, valor de penalidade (fitness).
-
-        Processo:
-        1. Decodifica para nodes e elements.
-        2. Checa distância mínima.
-        3. Monta e analisa pela classe Estrutura (FEA).
-        4. Calcula penalidade via penalidade_chassi.
-        """
-        try:
-            nodes, elements = self.decode_individual(x)
-            if not self.validate_min_distance(nodes):
-                return float('inf')
-            estrutura = Estrutura(elements, nodes)
-            estrutura.matrizes_global()
-            fixed = list(range(6))
-            Fg = np.zeros(estrutura.num_dofs)
-            Fg[0] = 300
-            Fg[2] = 300
-            disp = estrutura.static_analysis(Fg, fixed)
-            stresses = estrutura.compute_stress(estrutura.compute_strain(disp),210e9,0.27)
-            von = estrutura.compute_von_mises(stresses)
-            massa = estrutura.mass()
-            *_, KT, KF, _, _ = estrutura.shape_fun()
-            return penalidade_chassi(KT, KF, massa, von)
-        except Exception:
-            traceback.print_exc()
-            return float('inf')
-
-    def mutate_and_crossover(self, idx, pop):
-        """
-        Gera um novo indivíduo por DE/rand/1 + crossover binomial.
-
-        Entradas:
-        - idx: índice do indivíduo-alvo.
-        - pop: array (pop_size, dim) população atual.
-        Saída:
-        - u: array (dim,) candidato filho (ou x_i se inválido).
-        """
-        idxs = list(range(self.pop_size)); idxs.remove(idx)
-        a, b, c = np.random.choice(idxs, 3, replace=False)
-        x_i = pop[idx]
-        x_a, x_b, x_c = pop[a], pop[b], pop[c]
-        # mutação DE/rand/1
-        v = x_a + self.F * (x_b - x_c)
-        # crossover binomial
-        j_rand = np.random.randint(self.dim)
-        u = np.array([v[j] if np.random.rand()<self.CR or j==j_rand else x_i[j]
-                      for j in range(self.dim)])
-        # aplica bounds às coords
-        coords = self.enforce_bounds(u[:self.dim_coords].reshape(self.n,3)).reshape(-1)
-        tube_vars = np.clip(u[self.dim_coords:], 0, len(self.tipos_tubos)-1e-3)
-        for idx, tipo in self.fixed_tube_indices.items():
-            if isinstance(idx, int):  # Apenas conexões normais
-                t_idx = self.tipos_tubos.index(tipo)
-                tube_vars[idx] = t_idx + 0.01
-        u = np.concatenate([coords, tube_vars])
-        # valida distância
-        if self.validate_min_distance(self.decode_individual(u)[0]):
-            return u
-        return x_i
-
+    def mutate_and_crossover(self, pop):
+        new_pop = pop.copy()
+        for i in range(self.pop_size):
+            a, b, c = np.random.choice(np.delete(np.arange(self.pop_size), i), 3, replace=False)
+            v = pop[a] + self.F * (pop[b] - pop[c])
+            v[0:self.n * 3].reshape(self.n, 3)[self.is_central, 0] = 0.0
+            j_rand = np.random.randint(self.dim)
+            u = np.where((np.random.rand(self.dim) < self.CR) | (np.arange(self.dim) == j_rand), v, pop[i])
+            if np.allclose(u, pop[i], atol=1e-4): continue
+            key = hash(u.tobytes())
+            if key not in self.global_decoded_cache:
+                try:
+                    nodes, _ = self.decode_individual(u)
+                    if not self.validate_min_distance(nodes): continue
+                    self.global_decoded_cache[key] = (nodes, _)
+                except: continue
+            new_pop[i] = u
+        return new_pop
+    
+    def parallel_evaluate(self, nodes_list, elements_list):
+        if self.use_parallel:
+            with ProcessPoolExecutor(
+                max_workers=self.n_workers,
+                initializer=init_worker,
+                initargs=(self,)
+            ) as executor:
+                results = list(executor.map(evaluate, nodes_list, elements_list))
+        else:
+            results = [evaluate(nodes_list[i], elements_list[i]) for i in range(len(nodes_list))]
+        return results  
+      
     def optimize(self):
         """
-        Executa o loop principal de otimização.
+        Executa o loop principal de otimização, com avaliação paralela.
 
-        Saída:
-        - best_solution: tupla (nodes, elements) do melhor indivíduo.
-        - best_cost: float, custo associado.
-        - history: dict com listas de métricas por geração.
+        Retorna:
+        - best_solution: tupla (nodes, elements)
+        - best_cost: float
+        - best_mass, best_KT, best_KF: métricas físicas
+        - history: dicionário com histórico da evolução
+        - duration: float (tempo total em segundos)
         """
         print("Otimização Iniciada")
         pop, fit = self.initialize_population()
-        
-        # Variáveis para controle de convergência
-        convergence_count = 0
-        convergence_threshold = 3  # Número de gerações consecutivas para convergência
+
         history = {
-            'best_fit': [],
-            'avg_fit': [],
-            'std_dev': []
+            'best_fit': [], 'avg_fit': [], 'std_dev': [],
+            'best_mass': [], 'avg_mass': [],
+            'best_KT': [], 'avg_KT': [],
+            'best_KF': [], 'avg_KF': []
         }
-        
-        for gen in range(self.max_gens):
+
+        convergence_count = 0
+        convergence_threshold = 3
+        start_time = time.time()
+        # Abre pool de processos apenas uma vez
+        executor = None
+        if self.use_parallel:
+            executor = ProcessPoolExecutor(
+                max_workers=self.n_workers,
+                initializer=init_worker,
+                initargs=(self,)
+            )
+
+        # Loop de gerações
+        for gen in range(1, self.max_gens + 1):
+            t_gen = time.time()
+            
+            t1 = time.time()
+            cand_pop = self.mutate_and_crossover(pop)
+            t2 = time.time()
+
+            decoded = self.decode_population(cand_pop)
+            t3 = time.time()
+
+            nodes_list, elems_list = zip(*decoded)
+            t4 = time.time()
+            # Avaliação (paralela ou sequencial)
+            if executor:
+                results = list(executor.map(evaluate, nodes_list, elems_list))
+            else:
+                results = [evaluate(n, e) for n, e in zip(nodes_list, elems_list)]
+            t5 = time.time()
+
+            t6 = time.time()
             new_pop = pop.copy()
             new_fit = fit.copy()
-            
-            # Processa cada indivíduo
-            for i in range(self.pop_size):
-                u = self.mutate_and_crossover(i, pop)
-                f_u = self.evaluate(u)
-                if f_u <= fit[i]:
-                    new_pop[i] = u
-                    new_fit[i] = f_u
-            
-            pop = new_pop
-            fit = new_fit
-            
-            # Calcula estatísticas da população
-            best_fit = np.min(fit)
-            avg_fit = np.mean(fit)
-            std_dev = np.mean(np.std(pop, axis=0))  # Desvio padrão médio
-            
-            # Armazena histórico
+
+            new_mass = np.full(self.pop_size, np.nan)
+            new_KT   = np.full(self.pop_size, np.nan)
+            new_KF   = np.full(self.pop_size, np.nan)
+
+            for i, (f, m, kt, kf) in enumerate(results):
+                # Armazena métricas para análise estatística
+                new_mass[i] = m
+                new_KT[i]   = kt
+                new_KF[i]   = kf
+
+                # Substituição por seleção de DE
+                if f <= fit[i]:
+                    new_pop[i] = cand_pop[i]
+                    new_fit[i] = f
+
+            pop, fit = new_pop, new_fit
+
+            best_idx = np.argmin(fit)
+            best_fit = fit[best_idx]
+            avg_fit  = np.mean(fit)
+            std_dev  = float(np.std(pop))
+
             history['best_fit'].append(best_fit)
             history['avg_fit'].append(avg_fit)
             history['std_dev'].append(std_dev)
-            
-            # Verifica convergência
+            history['best_mass'].append(new_mass[best_idx])
+            history['avg_mass'].append(np.nanmean(new_mass))
+            history['best_KT'].append(new_KT[best_idx])
+            history['avg_KT'].append(np.nanmean(new_KT))
+            history['best_KF'].append(new_KF[best_idx])
+            history['avg_KF'].append(np.nanmean(new_KF))
+
             if std_dev < 0.02:
                 convergence_count += 1
-                print(f"Gen {gen+1}/{self.max_gens} Convergindo... (Std={std_dev:.4f}, Count={convergence_count})", end='\r')
             else:
                 convergence_count = 0
-                print(f"Gen {gen+1}/{self.max_gens} Best={best_fit:.4e} Std={std_dev:.4f}", end='\r')
-            
-            # Critério de parada por convergência
-            if convergence_count >= convergence_threshold:
-                print(f"\nConvergência alcançada na geração {gen+1} com desvio padrão {std_dev:.4f}")
-                break
-        
-        best_idx = np.argmin(fit)
-        best_solution = self.decode_individual(pop[best_idx])
-        return best_solution, fit[best_idx], history
 
-    def plotar(self, individuo):
+            t7 = time.time()
+
+            print(
+                f"[Gen {gen}] mutate: {t2 - t1:.2f}s | decode: {t3 - t2:.2f}s | eval: {t5 - t4:.2f}s | stats: {t7 - t6:.2f}s | total: {t7 - t_gen:.2f}s"
+            )
+
+            status = (f"Gen {gen}/{self.max_gens} — Best={best_fit:.4e} Std={std_dev:.4f}"
+                    if convergence_count < convergence_threshold
+                    else f"Convergência após {gen} gerações")
+            print(status, end='\r')
+
+            if convergence_count >= convergence_threshold:
+                print()
+                break
+
+        # Fecha pool de processos
+        if executor:
+            executor.shutdown()
+
+        duration = time.time() - start_time
+
+        best_idx       = np.argmin(fit)
+        best_solution  = self.decode_individual(pop[best_idx])
+        best_cost      = fit[best_idx]
+        best_mass      = history['best_mass'][-1]
+        best_KT        = history['best_KT'][-1]
+        best_KF        = history['best_KF'][-1]
+
+        return best_solution, best_cost, best_mass, best_KT, best_KF, history, duration
+
+    def plotar(self, individuo, save_path=None):
         """
         Plota a geometria do chassi evoluído em 3D.
 
         Entrada:
-        - individuo: tupla (nodes, elements).
+        - individuo: tupla (nodes, elements)
+        - save_path: caminho opcional para salvar a imagem
+
         Saída:
-        - exibe plot Matplotlib.
+        - exibe o plot e/ou salva a imagem se o caminho for fornecido.
         """
         nodes, elements = individuo
         fig = plt.figure(figsize=(10, 6))
@@ -427,12 +454,63 @@ class ChassisDEOptimizer:
         for i, j, t in elements_valid:
             ni, nj = nodes[i], nodes[j]
             ax.plot([ni[1], nj[1]], [ni[0], nj[0]], [ni[2], nj[2]], 'b-')
+
         ax.set_xlabel('Y')
         ax.set_ylabel('X')
         ax.set_zlabel('Z')
-        ax.set_box_aspect([3,1,2])
+        ax.set_box_aspect([3, 1, 2])
         plt.title("Chassi Evoluído")
+
+        if save_path:
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+            print(f"Visualização 3D salva em: {save_path}")
+
         plt.show()
+
+    def plot_metrics(self, history, save_path=None, show=True):
+        """
+        Gera gráfico de evolução das métricas: massa, rigidez torcional e flexional.
+
+        Entradas:
+        - history: dict com as listas 'best_mass', 'best_KT', 'best_KF'.
+        - save_path: caminho opcional para salvar o PNG.
+        - show: bool, se True exibe o plot.
+        """
+        plt.figure(figsize=(10, 6))
+        gens = range(len(history['best_mass']))
+        
+        # Configura eixo primário (massa)
+        ax1 = plt.gca()
+        ax1.plot(gens, history['best_mass'], 'b-', linewidth=2, label='Massa (kg)')
+        ax1.set_xlabel('Geração')
+        ax1.set_ylabel('Massa (kg)', color='b')
+        ax1.tick_params(axis='y', labelcolor='b')
+        
+        # Configura eixo secundário (rigidezes)
+        ax2 = ax1.twinx()
+        ax2.plot(gens, history['best_KT'], 'r-', linewidth=2, label='Rigidez Torcional (KT)')
+        ax2.plot(gens, history['best_KF'], 'g-', linewidth=2, label='Rigidez Flexional (KF)')
+        ax2.set_ylabel('Rigidez (N·m/rad ou N/m)', color='r')
+        ax2.tick_params(axis='y', labelcolor='r')
+        
+        plt.title('Evolução das Métricas do Melhor Indivíduo')
+        
+        # Unificar legendas
+        lines1, labels1 = ax1.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax1.legend(lines1 + lines2, labels1 + labels2, loc='best')
+        
+        plt.grid(True)
+        plt.tight_layout()
+        
+        if save_path:
+            plt.savefig(save_path)
+            print(f"Gráfico de métricas salvo em: {save_path}")
+        
+        if show:
+            plt.show()
+        else:
+            plt.close()
 
     def plot_convergence(self, history, save_path=None, show=True):
         """
@@ -482,62 +560,173 @@ class ChassisDEOptimizer:
         else:
             plt.close()
 
-    def save_solution(self, nodes, elements, file_path):
-        """
-        Salva nós e elementos em arquivo texto.
+    def plot_tradeoff(self, history, axises=('mass','KT'), save_path=None, show=True):
+        x_key = {'mass':'best_mass','KT':'best_KT','KF':'best_KF'}[axises[0]]
+        y_key = {'mass':'best_mass','KT':'best_KT','KF':'best_KF'}[axises[1]]
+        x, y = history[x_key], history[y_key]
+        plt.figure(figsize=(8,6))
+        sc = plt.scatter(x, y, c=range(len(x)), cmap='viridis', s=50)
+        plt.colorbar(sc, label='Geração')
+        plt.xlabel(axises[0].upper())
+        plt.ylabel(axises[1].upper())
+        plt.title(f"Trade-off: {axises[0]} × {axises[1]}")
+        plt.grid(True)
+        if save_path: plt.savefig(save_path, dpi=300)
+        if show: plt.show()
+        else: plt.close()
 
-        Entradas:
-        - nodes: array (N,3).
-        - elements: lista de tuplas.
-        - file_path: str, caminho de saída.
+    def plot_fitness_vs_metric(self, history, metric='mass', save_path=None, show=True):
+        mkey = f"best_{metric}"
+        x, y = history[mkey], history['best_fit']
+        plt.figure(figsize=(8,6))
+        sc = plt.scatter(x, y, c=range(len(x)), cmap='plasma', s=40)
+        plt.colorbar(sc, label='Geração')
+        plt.xlabel(metric.upper())
+        plt.ylabel('Fitness')
+        plt.title(f"Fitness × {metric.upper()}")
+        plt.grid(True)
+        if save_path: plt.savefig(save_path, dpi=300)
+        if show: plt.show()
+        else: plt.close()
+
+    def plot_all(self, history, results_dir, show=False):
+        os.makedirs(results_dir, exist_ok=True)
+        self.plot_convergence(history, save_path=os.path.join(results_dir,'convergencia.png'), show=show)
+        self.plot_metrics(history, save_path=os.path.join(results_dir,'evolucao_metricas.png'), show=show)
+        #self.plot_tradeoff(history, axises=('mass','KT'), save_path=os.path.join(results_dir,'tradeoff_mass_KT.png'), show=show)
+        #self.plot_tradeoff(history, axises=('mass','KF'), save_path=os.path.join(results_dir,'tradeoff_mass_KF.png'), show=show)
+        #self.plot_fitness_vs_metric(history,'mass', save_path=os.path.join(results_dir,'fitness_vs_mass.png'), show=show)
+        #self.plot_fitness_vs_metric(history,'KT',   save_path=os.path.join(results_dir,'fitness_vs_KT.png'), show=show)
+        #self.plot_fitness_vs_metric(history,'KF',   save_path=os.path.join(results_dir,'fitness_vs_KF.png'), show=show)
+        print(f"Todos os gráficos salvos em: {results_dir}")
+
+    def save_solution(self, nodes, elements, file_path, fitness=None, mass=None, KT=None, KF=None, duration=None):
+        """
+        Salva relatório completo em TXT, incluindo duração e valores do melhor indivíduo.
         """
         with open(file_path, 'w') as f:
             f.write("SOLUÇÃO FINAL DO CHASSI\n")
-            f.write("="*50 + "\n\n")
-            
-            # Salva nós
-            f.write("NÓS:\n")
-            f.write("Índice | Coordenada X | Coordenada Y | Coordenada Z\n")
-            f.write("-"*50 + "\n")
+            f.write("="*60 + "\n\n")
+            f.write(f"{self.max_gens} Gerações, {self.pop_size} individuos por população \n")
+            if duration is not None:
+                hrs, rem = divmod(duration, 3600)
+                mins, secs = divmod(rem, 60)
+                f.write(f"Duração da Otimização: {int(hrs)}h {int(mins)}m {secs:.1f}s\n")
+            if fitness is not None:
+                f.write(f"Melhor Fitness: {fitness:.6e}\n")
+            if mass is not None:
+                f.write(f"Massa: {mass:.3f} kg\n")
+            if KT is not None and KF is not None:
+                f.write(f"Rigidez Torcional (KT): {KT:.3e} N·m/rad\n")
+                f.write(f"Rigidez Flexional (KF): {KF:.3e} N/m\n")
+            f.write("\nNÓS (X, Y, Z):\n")
             for i, node in enumerate(nodes):
-                f.write(f"{i:6d} | {node[0]:11.3f} | {node[1]:11.3f} | {node[2]:11.3f}\n")
-            
-            # Salva elementos
-            f.write("\n\nELEMENTOS (CONEXÕES):\n")
-            f.write("Índice | Nó Inicial | Nó Final | Tipo de Tubo\n")
-            f.write("-"*50 + "\n")
-            for i, elem in enumerate(elements):
-                f.write(f"{i:6d} | {elem[0]:10d} | {elem[1]:9d} | {elem[2]}\n")
-        
-        print(f"Solução salva em: {file_path}")
+                f.write(f"{i:3d}: {node[0]:6.3f}, {node[1]:6.3f}, {node[2]:6.3f}\n")
+            f.write("\nELEMENTOS (Conexões):\n")
+            for i, (ni, nj, tp) in enumerate(elements):
+                f.write(f"{i:3d}: Nó {ni} - Nó {nj} | Perfil: {tp}\n")
+        print(f"Relatório completo salvo em: {file_path}")
 
-    def print_solution(self, nodes, elements):
+    def export_solution(self, nodes: np.ndarray, elements: list, directory: str, filename: str = "melhor_solucao"):
         """
-        Imprime no console nós e elementos formatados.
-
-        Entradas:
-        - nodes: array (N,3).
-        - elements: lista de tuplas.
+        Exporta a solução para arquivos CSV dentro do diretório especificado.
+        
+        Args:
+            nodes: array (N,3) com coordenadas dos nós
+            elements: lista de tuplas (i, j, perfil)
+            directory: diretório onde os arquivos serão salvos
+            filename: nome base para os arquivos (sem extensão)
         """
-        print("\n" + "="*50)
-        print("SOLUÇÃO FINAL DO CHASSI")
-        print("="*50)
+        # Garante que o diretório existe
+        os.makedirs(directory, exist_ok=True)
         
-        # Imprime nós
-        print("\nNÓS:")
-        print("Índice | Coordenada X | Coordenada Y | Coordenada Z")
-        print("-"*50)
-        for i, node in enumerate(nodes):
-            print(f"{i:6d} | {node[0]:11.6f} | {node[1]:11.6f} | {node[2]:11.6f}")
+        # Cria caminhos completos
+        nodes_path = os.path.join(directory, f"{filename}_nodes.csv")
+        elements_path = os.path.join(directory, f"{filename}_elements.csv")
         
-        # Imprime elementos
-        print("\n\nELEMENTOS (CONEXÕES):")
-        print("Índice | Nó Inicial | Nó Final | Tipo de Tubo")
-        print("-"*50)
-        for i, elem in enumerate(elements):
-            print(f"{i:6d} | {elem[0]:10d} | {elem[1]:9d} | {elem[2]}")   
+        # Exportar nós
+        with open(nodes_path, 'w') as f_nodes:
+            f_nodes.write("index,x,y,z\n")
+            for i, node in enumerate(nodes):
+                f_nodes.write(f"{i},{node[0]:.6f},{node[1]:.6f},{node[2]:.6f}\n")
+        
+        # Exportar elementos
+        with open(elements_path, 'w') as f_elements:
+            f_elements.write("node_i,node_j,perfil\n")
+            for elem in elements:
+                f_elements.write(f"{elem[0]},{elem[1]},{elem[2]}\n")
+        
+        print(f"Solucao exportada para:")
+        print(f" - Nodes: {nodes_path}")
+        print(f" - Elements: {elements_path}")
 
-def penalidade_chassi(KT, KF, massa, tensoes):
+def evaluate(nodes,elements) -> float:
+    """
+    Avalia o custo de um indivíduo.
+
+    Entrada:
+    - nodes
+    - elements
+    Saída:
+    - float, valor de penalidade (fitness).
+
+    Processo:
+    1. Decodifica para nodes e elements.
+    2. Checa distância mínima.
+    3. Monta e analisa pela classe Estrutura (FEA).
+    4. Calcula penalidade via penalidade_chassi.
+    """
+    try:
+        t0 = time.perf_counter()
+
+        # Instanciamento da estrutura
+        estrutura = Estrutura(elements, nodes)
+        t1 = time.perf_counter()
+
+        estrutura.matrizes_global()
+        t2 = time.perf_counter()
+
+        fixed = list(range(6))
+        Fg = np.zeros(estrutura.num_dofs)
+        for i in [7, 8, 21, 22]:
+            Fg[i * 6 + 2] = (65 * 9.81) / 4
+
+        _, _, frequencies = estrutura.modal_analysis()
+        t3 = time.perf_counter()
+
+        disp = estrutura.static_analysis(Fg, fixed)
+        t4 = time.perf_counter()
+
+        strain = estrutura.compute_strain(disp)
+        stresses = estrutura.compute_stress(strain)
+        von = estrutura.compute_von_mises(stresses)
+        t5 = time.perf_counter()
+
+        massa = estrutura.mass()
+        *_, KT, KF, _, _ = estrutura.shape_fun()
+        t6 = time.perf_counter()
+
+        penalty = penalidade_chassi(KT, KF, massa, von, frequencies)
+        t7 = time.perf_counter()
+
+        print(f"""[EVALUATE]
+        - Instância:     {t1 - t0:.4f}s
+        - Montagem K/M:  {t2 - t1:.4f}s
+        - Modal:         {t3 - t2:.4f}s
+        - Estática:      {t4 - t3:.4f}s
+        - Tensão/Von:    {t5 - t4:.4f}s
+        - Massa/Rigidez: {t6 - t5:.4f}s
+        - Penalidade:    {t7 - t6:.4f}s
+        - Total:         {t7 - t0:.4f}s
+        """)
+
+        return penalty, massa, KT, KF
+
+    except Exception:
+        traceback.print_exc()
+        return 1e9, 1e9, 0.0, 0.0
+
+def penalidade_chassi(KT, KF, massa, tensoes, frequencias):
     """
     Calcula penalidade total do chassi.
 
@@ -545,18 +734,20 @@ def penalidade_chassi(KT, KF, massa, tensoes):
     - KT, KF: floats de rigidezes.
     - massa: float.
     - tensoes: array de floats.
+    - frequencias: array de frequencias naturais.
     Saída:
     - penalidade_total: float.
     """
+
     # Limites e parâmetros
-    KT_min = 1e7          # Rigidez torcional mínima (N·m/rad)
-    KF_min = 1e6          # Rigidez flexão mínima (N/m)
-    massa_ideal = 23       # Massa alvo (kg)
-    K_mola = 5e5           # Constante da mola do amortecedor (N/m)
-    tensao_adm = 250e6     # Tensão admissível do material (Pa)
-    alpha = 0.5            # Fator de sensibilidade exponencial
-    beta = 10              # Fator de escala logarítmica
-    
+    KT_min = 1e7                # Rigidez torcional mínima (N·m/rad)
+    KF_min = 1e6                # Rigidez flexão mínima (N/m)
+    massa_ideal = 23            # Massa alvo (kg)
+    K_mola = 5e5                # Constante da mola do amortecedor (N/m)
+    tensao_adm = 250e6          # Tensão admissível do material (Pa)
+    alpha = 0.5                 # Fator de sensibilidade exponencial
+    beta = 10                   # Fator de escala logarítmica
+    freq_motor = 4800           # Rotação do motor dada em (RPM) e convertida para (Hz)
     penalidade_total = 0
 
     # 1. Rigidez Torcional (Função Exponencial)
@@ -597,135 +788,97 @@ def penalidade_chassi(KT, KF, massa, tensoes):
     razao_tensoes = np.ptp(tensoes) / np.mean(tensoes) if np.mean(tensoes) > 0 else 0
     penalidade_total += np.log(1 + razao_tensoes)
 
+    # 7. Frequências Naturais em Zona de Ressonância com o Motor (Função exponencial)
+    freq_crit_min = (0.95*freq_motor)/60        #Frequência crítica mínima convertida para Hz
+    freq_crit_max = (1.05*freq_motor)/60        #Frequência crítica máxima convertida para Hz
+
+    for f in frequencias:
+        # Penalidade exponencial mais severa para frequências próximas a do motor
+        if freq_crit_min <= f <= freq_crit_max:
+            severidade = np.exp(alpha * (1 - abs((f - freq_motor) / freq_motor)))
+            penalidade_total += 100 * severidade 
     return penalidade_total * 100  # Fator de escala global
 
 if __name__ == "__main__":
-    nodes = np.array([[0.145,  0.000,	0.445],  #00* 
-[0.145,  0.000,	0.155],  #01* 
-[0.215,  0.465,	0.280],  #02
-[0.215,  0.465,	0.070],  #03* 
-[0.175,  0.670,	0.520],  #04
-[0.210,  0.670,	0.270],  #05
-[0.230,  0.865,	0.080],  #06* 
-[0.220,  0.865,	0.275],  #07
-[0.185,  0.865,	0.480],  #08
-[0.185,  0.865,	0.555],  #09
-[0.095,  0.865,	0.600],  #10*
-[0.380,  1.205,	0.000],  #11*
-[0.380,  1.605,	0.265],  #12
-[0.390,  1.605,	0.000],  #13*
-[0.380,  1.755,	0.265],  #14
-[0.390,  1.755,	0.000],  #15*
-[0.370,  2.055,	0.270],  #16
-[0.395,  2.055,	0.000],  #17
-[0.255,  2.400,	0.000],  #18*
-[0.255,  2.245,	0.000],  #19*
-[0.255,  2.400,	0.265],  #20*
-[0.190,  2.260,	0.405],  #21
-[0.130,  1.730,	0.920],  #22
-[0.130,  1.605,	0.920],  #23
-[0.100,  1.605,	1.040],  #24
-[0.000,  1.605,	1.115],  #25
-[0.255,  2.090,	0.270],  #26
-[0.255,  2.090,	0.000]]) #27
+    nodes = np.array([[-0.181,  0.000,  0.360],             #00
+    [-0.181,  0.000,  0.050],                               #01
+    [-0.280,  0.275,  0.240],                               #02
+    [-0.285,  0.495,  0.045],                               #03
+    [-0.285,  0.555,  0.270],                               #04
+    [-0.212,  0.555,  0.550],                               #05
+    [-0.293,  1.370,  0.250],                               #06
+    [-0.268,  1.350,  0.000],                               #07
+    [-0.268,  1.495,  0.015],                               #08
+    [-0.302,  1.670,  0.240],                               #09
+    [-0.271,  1.665,  0.030],                               #10
+    [-0.271,  1.835,  0.070],                               #11
+    [-0.183,  2.015,  0.285],                               #12
+    [-0.183,  2.015,  0.060],                               #13
+    [-0.170,  1.400,  0.965],                               #14
+    [ 0.000,  1.410,  1.105],                               #15
+    [-0.293,  1.950,  0.250]])                              #16
 
-    connections = ((0,1),
-(0,2),
-(0,4),
-(1,3),
-(1,2),
-(2,4),
-(2,5),
-(2,3),
-(3,5),
-(3,6),
-(4,5),
-(4,7),
-(4,9),
-(5,6),
-(5,7),
-(6,7),
-(6,11),
-(7,8),
-(7,11),
-(7,12),
-(8,9),
-(8,12),
-(9,10),
-(11,12),
-(11,13),
-(12,13),
-(12,14),
-(12,15),
-(12,23),
-(13,15),
-(14,15),
-(14,16),
-(15,16),
-(15,17),
-(16,17),
-(16,26),
-(16,27),
-(17,27),
-(18,27),
-(18,19),
-(18,20),
-(19,20),
-(19,26),
-(19,27),
-(20,21),
-(20,26),
-(21,26),
-(21,22),
-(22,23),
-(22,24),
-(23,24),
-(24,25),
-(26,27))
+    connections = [(0,1)  ,(0,2)  ,(1,2)  ,(0,5)  ,(2,5)  ,(2,4)  ,(2,3)  ,(1,3)  ,
+                (3,7)  ,(3,4)  ,(4,7)  ,(4,6)  ,(5,6)  ,(7,6)  ,(7,8)  ,(6,8)  ,
+                (6,9)  ,(8,9)  ,(8,10) ,(9,10) ,(9,11) ,(10,11),(11,16),(16,13),
+                (11,12),(11,13),(12,13),(12,16),(16,14),(14,15),(14,6) ,(9,16) ,
+                (4,5)]
 
-
-    fixed_tube={0: "Tubo B",1: "Tubo B",2: "Tubo B","espelho_0": "Tubo B","espelho_1": "Tubo B"}
-
-    mirror_connections = [0, 1, 3, 6, 10, 11, 13, 15, 18, 19, 20]
-
-    indices = [0,1,3,5,6,7,8,10,14,15,16,17,18,19,20,21,22]
-
-
-        # Criar diretório para resultados
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    results_dir = f"resultados_otimizacao_{timestamp}"
+    indices = [0,1,3,4,5,6,7,8,11,16]
+    tubos_fixos = {
+    0: 'Tubo A',
+    1: 'Tubo A',
+    2: 'Tubo A',
+    'espelho_0': 'Tubo C',
+    'espelho_1': 'Tubo C',
+    'espelho_3': 'Tubo C',
+    'espelho_5': 'Tubo C',
+}
+    
+    connect_with_mirror = [0,1,3,5,7,8,10,11,12,13]
+    # Criar diretório para resultados
+    timestamp = datetime.now().strftime("%Y-%m-%d %H%M")
+    max_gen = 5
+    pop_size = 5
+    otimizador = ChassisDEOptimizer(
+        base_nodes=nodes,
+        base_connections=connections,
+        mandatory_indices=indices,
+        pop_size=pop_size,
+        max_generations=max_gen,
+        use_parallel=True,     # ou False, se quiser forçar modo serial
+        n_workers=4,            # defina quantos núcleos usar
+        tubos_fixos=tubos_fixos,
+        connect_with_mirror=connect_with_mirror
+        )
+    
+    results_dir = f"Resultados_Otimizacao_LOCAL__{timestamp}_{max_gen}GEN_{pop_size}POP"
     os.makedirs(results_dir, exist_ok=True)
 
-    otimizador = ChassisDEOptimizer(
-        base_nodes= nodes,
-        base_connections = connections,
-        mandatory_indices = indices,
-        connect_with_mirror = mirror_connections,
-        pop_size=10,
-        F=0.6,
-        CR=0.8,
-        max_generations=5,
-        fixed_tube_indices = fixed_tube)
-
-    best_indiv, best_cost, history = otimizador.optimize()
-    print(f"\nMelhor custo: {best_cost:.6e}")
+    best_indiv, best_cost, best_mass, best_KT, best_KF, history,duration = otimizador.optimize()
+    print(f"\nRESULTADOS FINAIS:")
+    print(f"Melhor custo: {best_cost:.6e}")
+    print(f"Massa: {best_mass:.2f} kg")
+    print(f"Rigidez Torcional (KT): {best_KT:.2e} N·m/rad")
+    print(f"Rigidez Flexional (KF): {best_KF:.2e} N/m")
     nodes_final, elements_final = best_indiv
-    
-    # 1. Imprimir solução no console
-    otimizador.print_solution(nodes_final, elements_final)
-    
-    # 2. Salvar solução em arquivo TXT
+
+    print(nodes_final)
+    print(elements_final)
+    # Salvar solução em arquivo TXT
     solution_path = os.path.join(results_dir, "solucao_final.txt")
-    otimizador.save_solution(nodes_final, elements_final, solution_path)
+    otimizador.save_solution(
+        nodes_final, elements_final, solution_path,
+        fitness=best_cost, mass=best_mass, KT=best_KT, KF=best_KF, duration=duration)
     
-    # 3. Salvar gráfico de histórico
-    convergence_path = os.path.join(results_dir, "historico_convergencia.png")
-    otimizador.plot_convergence(history, save_path=convergence_path, show=True)
-    
-    # 4. Plotar solução final
-    otimizador.plotar(best_indiv)
-    
-    # Salvar também a visualização 3D
-    plot_path = os.path.join(results_dir, "visualizacao_3d.png")
-    plt.savefig(plot_path)
-    print(f"Visualização 3D salva em: {plot_path}")
+    # Geração de todos os gráficos de uma única vez
+    otimizador.plot_all(history, results_dir, show=False)
+    # visualização 3D final
+    otimizador.plotar(best_indiv, save_path=os.path.join(results_dir,'visualizacao_3d.png'))
+
+    # Exportar para arquivos
+    otimizador.export_solution(
+        nodes_final, 
+        elements_final, 
+        directory=results_dir,
+        filename="solucao_otimizada")
