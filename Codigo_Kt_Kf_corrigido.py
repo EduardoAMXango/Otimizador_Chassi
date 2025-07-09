@@ -1,4 +1,4 @@
-#Atualização KT e KF
+#Atualização def find_new_index
 
 import numpy as np
 from copy import deepcopy
@@ -152,15 +152,24 @@ class ChassisDEOptimizer:
         Caso seja um nó central retorna apenas o novo indice do nó
         
         Entradas:
-        - old_index: Índice do nó
+        - old_index: Índice do nó no base_nodes
 
         Retorno:
         - new_index: Índice do nó após passar pela otimização
-        - mirrored_index: Se o nó inicial não for central retorna o índice do nó espelhado correspondente
+        - mirrored_index: índice do nó espelhado correspondente
+        - new_central_index: novo index se for um nó central
         """
         new_index = old_index*2
         mirrored_index = old_index*2+1
-        return new_index if self.is_central[old_index] else new_index,mirrored_index
+
+        for i in range(len(self.base_nodes)):
+            if self.is_central[i]:
+                first_central=i
+                break
+        
+        new_central_index=(first_central*2)+(old_index-first_central)
+        
+        return new_central_index if self.is_central[old_index] else new_index,mirrored_index
     
     def validate_min_distance(self, coords: np.ndarray, min_dist: float = 0.05) -> bool:
         """
