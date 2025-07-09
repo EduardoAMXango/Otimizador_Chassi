@@ -1,15 +1,17 @@
-#Rascunho - def find_new_index
+#Rework do find new index para nós centrais
 
 import numpy as np
 from copy import deepcopy
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import traceback
 from scipy.spatial.distance import pdist
-from Estrutura_Tipada import Estrutura #Substituir pelo nome correto da main
+from rascunho_KT_new import Estrutura #Substituir pelo nome correto da main
 import matplotlib.pyplot as plt
 import os
 from datetime import datetime
 import time
+
+from rascunho_KT_new import K_global
 
 def init_worker(optimizer_instance):
     """
@@ -36,10 +38,10 @@ class ChassisDEOptimizer:
         base_nodes: np.ndarray,
         base_connections: list,
         mandatory_indices: list,
-        pop_size: int = 50,
+        pop_size: int = 2,
         F: float = 0.5,
         CR: float = 0.9,
-        max_generations: int = 200,
+        max_generations: int = 5,
         radius_mand: float = 0.025,
         radius_opt: float = 0.05,
         use_parallel: bool = True,
@@ -154,11 +156,20 @@ class ChassisDEOptimizer:
 
         Retorno:
         - new_index: Índice do nó após passar pela otimização
-        - mirrored_index: Se o nó inicial não for central retorna o índice do nó espelhado correspondente
+        - mirrored_index: índice do nó espelhado correspondente
+        - new_central_index: novo index se for um nó central
         """
         new_index = old_index*2
         mirrored_index = old_index*2+1
-        return new_index if self.is_central[old_index] else new_index,mirrored_index
+
+        for i in range(len(self.base_nodes)):
+            if self.is_central[i]:
+                first_central=i
+                break
+        
+        new_central_index=(first_central*2)+(old_index-first_central)
+        
+        return new_central_index if self.is_central[old_index] else new_index,mirrored_index
     
     def validate_min_distance(self, coords: np.ndarray, min_dist: float = 0.05) -> bool:
         """
@@ -707,7 +718,10 @@ def evaluate(nodes,elements) -> float:
         t5 = time.perf_counter()
 
         massa = estrutura.mass()
-        *_, KT, KF, _, _ = estrutura.shape_fun()
+        LFnode,RFnode = otimizador.find_new_index(3) #Left front suspension node index (3)
+        LRnode,RRnode = otimizador.find_new_index(11) #Left rear suspension node index (11)
+        LCnode,RCnode = otimizador.find_new_index(7) #Left central node index (7)
+        KT, KF = estrutura.compute_Kf_Kt(K_global,LFnode,LRnode,RFnode,RRnode,LCnode,RCnode)
         t6 = time.perf_counter()
 
         penalty = penalidade_chassi(KT, KF, massa, von, frequencies)
