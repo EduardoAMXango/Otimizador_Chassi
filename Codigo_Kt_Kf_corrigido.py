@@ -1,4 +1,4 @@
-#Atualização KT e KF
+#find_new_index + class Estrutura
 
 import numpy as np
 from copy import deepcopy
@@ -99,7 +99,7 @@ class Estrutura:
         return self.car_mass
     
     def obter_propriedades(self, tube_nome):                                                #Função que lê a planilha 'tubos.csv' e extrai as propriedades de cada tipo de tubo lá presentes
-        df = pd.read_csv('xango/codes/tubos.csv')  
+        df = pd.read_csv('tubos.csv')  
         tubo = df[df['Tube'] == tube_nome]
     
         if tubo.empty:
@@ -883,10 +883,10 @@ class ChassisDEOptimizer:
         base_nodes: np.ndarray,
         base_connections: list,
         mandatory_indices: list,
-        pop_size: int = 2,
+        pop_size: int = 10,
         F: float = 0.5,
         CR: float = 0.9,
-        max_generations: int = 5,
+        max_generations: int = 20,
         radius_mand: float = 0.025,
         radius_opt: float = 0.05,
         use_parallel: bool = True,
@@ -1502,7 +1502,7 @@ def find_new_index(old_index, nodes):
     
     Entradas:
     - old_index: Índice do nó no base nodes
-    - nodes: lista de nós
+    - nodes: lista de nós pós otimização
     Retorno:
     - new_index: Índice do nó após passar pela otimização
     - mirrored_index: índice do nó espelhado correspondente
@@ -1510,18 +1510,15 @@ def find_new_index(old_index, nodes):
     """
     is_central = np.isclose(nodes[:, 0], 0.0)
     
-    new_index = old_index*2
-    mirrored_index = old_index*2+1
-    
-    if is_central[old_index*2]:
-        for i in range(len(nodes)):
-            if is_central[i]:
-                first_central=i
-                break
-        new_central_index=first_central+(old_index-(first_central/2))
-        return new_central_index  
-    
-    else: return new_index,mirrored_index
+    first_central = np.sum(~is_central)
+
+    if (old_index*2)>=first_central:
+        new_central_index=first_central+(old_index-(first_central//2))
+        return new_central_index
+    else:
+        new_index=old_index*2
+        mirrored_index=new_index+1
+        return new_index,mirrored_index
 
 def evaluate(nodes,elements) -> float:
     """
@@ -1726,7 +1723,7 @@ if __name__ == "__main__":
     print(f"\nRESULTADOS FINAIS:")
     print(f"Melhor custo: {best_cost:.6e}")
     print(f"Massa: {best_mass:.2f} kg")
-    print(f"Rigidez Torcional (KT): {best_KT:.2e} N·m/rad")
+    print(f"Rigidez Torcional (KT): {best_KT:.2f} N·m/rad")
     print(f"Rigidez Flexional (KF): {best_KF:.2e} N/m")
     nodes_final, elements_final = best_indiv
 
